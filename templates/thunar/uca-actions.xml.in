@@ -19,7 +19,7 @@
     <name>@L_COMPRESS_7Z@</name>
     <submenu>7-Zip</submenu>
     <unique-id>7zctx-compress-7z</unique-id>
-    <command>@HELPER_SH_QUOTED@ compress 7z %F</command>
+    <command>@HELPER_SH_QUOTED@ compress 7z --ask %F</command>
     <description>7-Zip</description>
     <patterns>*</patterns>
     <directories/>
@@ -34,7 +34,7 @@
     <name>@L_COMPRESS_ZIP@</name>
     <submenu>7-Zip</submenu>
     <unique-id>7zctx-compress-zip</unique-id>
-    <command>@HELPER_SH_QUOTED@ compress zip %F</command>
+    <command>@HELPER_SH_QUOTED@ compress zip --ask %F</command>
     <description>7-Zip</description>
     <patterns>*</patterns>
     <directories/>
@@ -49,7 +49,7 @@
     <name>@L_COMPRESS_TARGZ@</name>
     <submenu>7-Zip</submenu>
     <unique-id>7zctx-compress-targz</unique-id>
-    <command>@HELPER_SH_QUOTED@ compress tar.gz %F</command>
+    <command>@HELPER_SH_QUOTED@ compress tar.gz --ask %F</command>
     <description>7-Zip</description>
     <patterns>*</patterns>
     <directories/>

@@ -529,3 +529,29 @@ t_i14_installed_helper_works_with_installed_lists() {
   assert_rc 0
   assert_exists "$W/a/plain/um.txt"
 }
+
+t_i15_quick_compress_actions_ask_for_name_and_folder() {
+  inst install --fm all --lang en
+  assert_rc 0
+  local f n
+  # os três "Compactar em ..." chamam o helper com --ask em todos os exploradores
+  assert_eq "$(grep -c -e 'compress [a-z.0-9]* --ask' "$HOME/.local/share/kio/servicemenus/7z-context.desktop")" 3
+  assert_eq "$(grep -c -e 'compress [a-z.0-9]* --ask' "$HOME/.config/Thunar/uca.xml")" 3
+  for f in "$HOME/.local/share/nemo/actions"/7zctx-compress-{7z,zip,targz}.nemo_action \
+    "$HOME/.local/share/file-manager/actions"/7zctx-compress-{7z,zip,targz}.desktop \
+    "$HOME/.local/share/nautilus/scripts/7-Zip/Compress to .7z" \
+    "$HOME/.config/caja/scripts/7-Zip/Compress to .zip"; do
+    [[ -e $f ]] || continue
+    grep -q -e '--ask' "$f" || fail "no --ask in $f"
+  done
+  # executa de verdade a ação do Dolphin, com as respostas do diálogo no modo de teste
+  local raw
+  raw=$(awk '/^\[Desktop Action compress7z\]/{a=1;next} /^\[/{a=0} a&&/^Exec=/{print;exit}' "$HOME/.local/share/kio/servicemenus/7z-context.desktop")
+  raw=${raw#Exec=}
+  echo x >"$W/a.txt"
+  mapfile -d '' -t argv < <(desktop_exec_args "$raw" "$W/a.txt")
+  CTX7Z_FORM_NAME="escolhido" CTX7Z_FORM_DEST="$W/onde" "${argv[@]}" >/dev/null 2>&1 </dev/null || fail "Exec failed: ${argv[*]}"
+  assert_exists "$W/onde/escolhido.7z"
+  n=$(find "$W" -name '*.7z' | wc -l)
+  assert_eq "$n" 1
+}

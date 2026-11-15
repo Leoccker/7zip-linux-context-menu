@@ -27,9 +27,9 @@ ALL_FMS=(dolphin nautilus nemo thunar caja pcmanfm)
 # id|English label|Portuguese label|icon|kind (any = files and folders, archive = archives only)|helper arguments
 ACTIONS=(
   'compress-dialog|Add to archive…|Adicionar ao arquivo…|archive-insert|any|compress-dialog'
-  'compress-7z|Compress to .7z|Compactar em .7z|archive-insert|any|compress 7z'
-  'compress-zip|Compress to .zip|Compactar em .zip|archive-insert|any|compress zip'
-  'compress-targz|Compress to .tar.gz|Compactar em .tar.gz|archive-insert|any|compress tar.gz'
+  'compress-7z|Compress to .7z|Compactar em .7z|archive-insert|any|compress 7z --ask'
+  'compress-zip|Compress to .zip|Compactar em .zip|archive-insert|any|compress zip --ask'
+  'compress-targz|Compress to .tar.gz|Compactar em .tar.gz|archive-insert|any|compress tar.gz --ask'
   'extract-here|Extract here|Extrair aqui|archive-extract|archive|extract-here'
   'extract-to|Extract to folder|Extrair para pasta própria|archive-extract|archive|extract-to'
   'test|Test archive|Testar arquivo|dialog-ok|archive|test'

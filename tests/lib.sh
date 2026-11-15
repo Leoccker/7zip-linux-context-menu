@@ -95,6 +95,7 @@ echo "zenity $*" >>"$STUB_LOG"
 mode=""
 entry_text=""
 filename=""
+dirmode=0
 rows=()
 for a in "$@"; do
   case $a in
@@ -104,6 +105,8 @@ for a in "$@"; do
     --list) mode=list ;;
     --text-info) mode=textinfo ;;
     --question) mode=question ;;
+    --file-selection) mode=filesel ;;
+    --directory) dirmode=1 ;;
     --info|--error|--warning) mode=msg ;;
     --entry-text=*) entry_text=${a#--entry-text=} ;;
     --filename=*) filename=${a#--filename=} ;;
@@ -117,14 +120,37 @@ case $mode in
     idx=$(cat "$dir/pwidx" 2>/dev/null || echo 0)
     echo $((idx + 1)) >"$dir/pwidx"
     line=$(sed -n "$((idx + 1))p" "${STUB_PW_SEQ:-/dev/null}")
-    [[ -n $line ]] || exit 1
+    if [[ -z $line ]]; then
+      [[ ${STUB_PW_EMPTY:-0} == 1 ]] && { echo; exit 0; }
+      exit 1
+    fi
     printf '%s\n' "$line"
     ;;
   progress)
     if [[ ${STUB_CANCEL:-0} == 1 ]]; then read -r _; exit 1; fi
-    cat >/dev/null
+    # grava cada linha recebida com a hora (ms) e a hora em que o stub é encerrado
+    trap 'echo $(($(date +%s%N) / 1000000)) >"$dir/progress.end"; exit 0' TERM
+    while IFS= read -r l; do
+      printf '%s %s\n' "$(($(date +%s%N) / 1000000))" "$l" >>"$dir/progress.in"
+    done
     ;;
-  entry) printf '%s\n' "${STUB_ENTRY:-$entry_text}" ;;
+  filesel)
+    [[ ${STUB_FILESEL_CANCEL:-0} == 1 ]] && exit 1
+    if [[ $dirmode == 1 ]]; then
+      printf '%s\n' "${STUB_DIR_PICK:-${filename%/}}"
+    else
+      printf '%s\n' "${STUB_SAVE_PICK:-$filename}"
+    fi
+    ;;
+  entry)
+    if [[ -n ${STUB_ENTRY_SEQ:-} ]]; then
+      idx=$(cat "$dir/entryidx" 2>/dev/null || echo 0)
+      echo $((idx + 1)) >"$dir/entryidx"
+      sed -n "$((idx + 1))p" "$STUB_ENTRY_SEQ"
+    else
+      printf '%s\n' "${STUB_ENTRY:-$entry_text}"
+    fi
+    ;;
   list)
     if [[ -n ${STUB_CHOICES:-} ]]; then
       read -r first rest <<<"$STUB_CHOICES"

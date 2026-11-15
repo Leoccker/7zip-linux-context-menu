@@ -436,7 +436,10 @@ t_d04_dialog_cancel_has_no_side_effects() {
 
 t_d05_dialog_name_validation_and_split() {
   echo x >"$W/a.txt"
-  CTX7Z_FORM_NAME="a/b" run "$H" compress-dialog "$W/a.txt"
+  CTX7Z_FORM_NAME="a/" run "$H" compress-dialog "$W/a.txt"
+  assert_rc 64
+  assert_contains "$ERR" "Invalid archive name"
+  CTX7Z_FORM_NAME=".." run "$H" compress-dialog "$W/a.txt"
   assert_rc 64
   CTX7Z_FORM_SPLIT=abc run "$H" compress-dialog "$W/a.txt"
   assert_rc 64
@@ -550,6 +553,195 @@ t_u08_no_dialog_tool_only_notify() {
   assert_rc_not 0
   grep -q 'zenity, kdialog or yad' "$STUB_LOG" || fail "no explanation sent: $(cat "$STUB_LOG")"
   assert_not_exists "$W/a.7z"
+}
+
+# ------------------------------------------------------------------ nome e pasta do arquivo
+
+t_n01_name_may_be_relative_or_absolute_path() {
+  mkdir "$W/Fotos"
+  echo x >"$W/Fotos/a.txt"
+  run "$H" compress 7z --name sub/meu -- "$W/Fotos"
+  assert_rc 0
+  assert_exists "$W/sub/meu.7z"
+  run "$H" compress zip --name "$T/abs/out" -- "$W/Fotos"
+  assert_rc 0
+  assert_exists "$T/abs/out.zip"
+  assert_contains "$ERR" "Created: $T/abs/out.zip"
+}
+
+t_n02_invalid_names_rejected() {
+  echo x >"$W/a.txt"
+  local n
+  for n in "dir/" ".." "a/.." "/"; do
+    run "$H" compress 7z --name "$n" -- "$W/a.txt"
+    assert_rc 64
+    assert_contains "$ERR" "Invalid archive name"
+  done
+  [[ $(find "$W" -type f | wc -l) -eq 1 ]] || fail "unexpected files: $(find "$W" -type f)"
+}
+
+t_n03_dest_option_creates_folder_and_keeps_source() {
+  echo x >"$W/a.txt"
+  run "$H" compress 7z --dest "$W/novo/dest" -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/novo/dest/a.7z"
+  assert_exists "$W/a.txt"
+  # --dest relativo vale a partir do diretório atual; nome relativo, a partir do --dest
+  run "$H" compress zip --dest rel --name in/x -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/rel/in/x.zip"
+  # nome absoluto ignora --dest
+  run "$H" compress zip --dest "$W/ignorado" --name "$W/abs" -- "$W/a.txt"
+  assert_exists "$W/abs.zip"
+  assert_not_exists "$W/ignorado"
+}
+
+t_n04_dest_works_for_tarballs_and_collisions() {
+  echo x >"$W/a.txt"
+  run "$H" compress tar.gz --dest "$W/d" -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/d/a.tar.gz"
+  run "$H" compress tar.gz --dest "$W/d" -- "$W/a.txt"
+  assert_exists "$W/d/a (2).tar.gz"
+}
+
+t_n05_dest_not_writable_fails_cleanly() {
+  echo x >"$W/a.txt"
+  run "$H" compress 7z --dest /proc/nao-pode -- "$W/a.txt"
+  assert_rc 2
+  assert_contains "$ERR" "Cannot write to the folder"
+}
+
+t_n06_archive_inside_its_own_source_folder() {
+  mkdir "$W/Fotos"
+  echo x >"$W/Fotos/a.txt"
+  run "$H" compress 7z --dest "$W/Fotos" -- "$W/Fotos"
+  assert_rc 0
+  assert_exists "$W/Fotos/Fotos.7z"
+  local listing
+  listing=$("$SZ" l -ba -spd "$W/Fotos/Fotos.7z" </dev/null)
+  assert_contains "$listing" "Fotos/a.txt"
+  [[ $listing != *"Fotos.7z"* ]] || fail "archive contains itself"
+}
+
+t_n07_ask_headless_uses_form_values() {
+  echo x >"$W/a.txt"
+  CTX7Z_FORM_NAME=escolhido CTX7Z_FORM_DEST="$W/pasta" run "$H" compress zip --ask -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/pasta/escolhido.zip"
+  # sem valores, --ask mantém os padrões
+  run "$H" compress zip --ask -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/a.zip"
+  # cancelar não cria nada
+  CTX7Z_FORM_CANCEL=1 run "$H" compress 7z --ask -- "$W/a.txt"
+  assert_rc 3
+  assert_not_exists "$W/a.7z"
+  # nome inválido vindo do diálogo
+  CTX7Z_FORM_NAME="x/" run "$H" compress 7z --ask -- "$W/a.txt"
+  assert_rc 64
+}
+
+t_n08_compress_dialog_dest_and_name_with_path() {
+  mkdir "$W/Docs"
+  echo x >"$W/Docs/a.txt"
+  CTX7Z_FORM_DEST="$W/saida" run "$H" compress-dialog "$W/Docs"
+  assert_rc 0
+  assert_exists "$W/saida/Docs.7z"
+  CTX7Z_FORM_DEST="$W/saida" CTX7Z_FORM_NAME="sub/outro" CTX7Z_FORM_FORMAT=zip run "$H" compress-dialog "$W/Docs"
+  assert_rc 0
+  assert_exists "$W/saida/sub/outro.zip"
+  CTX7Z_FORM_NAME="$W/livre" CTX7Z_FORM_DEST="$W/saida" run "$H" compress-dialog "$W/Docs"
+  assert_exists "$W/livre.7z"
+}
+
+t_n09_ask_dialog_via_save_chooser() {
+  make_ui_stubs
+  echo x >"$W/a.txt"
+  # o seletor "Salvar como" começa em <pasta do item>/<nome>.<formato> e devolve o caminho escolhido
+  CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress 7z --ask -- "$W/a.txt"
+  assert_rc 0
+  grep -q -- "--file-selection --save .*--filename=$W/a.7z" "$STUB_LOG" || fail "bad default: $(grep file-selection "$STUB_LOG")"
+  assert_exists "$W/a.7z"
+  mkdir "$W/novo"
+  STUB_SAVE_PICK="$W/novo/meu nome.7z" CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress 7z --ask -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/novo/meu nome.7z"
+  [[ ! -e "$W/novo/meu nome.7z.7z" ]] || fail "extension duplicated"
+  assert_contains "$ERR$(<"$STUB_LOG")" "Created: $W/novo/meu nome.7z"
+}
+
+t_n10_ask_dialog_cancel_creates_nothing() {
+  make_ui_stubs
+  echo x >"$W/a.txt"
+  STUB_FILESEL_CANCEL=1 CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress 7z --ask -- "$W/a.txt"
+  assert_rc 3
+  assert_not_exists "$W/a.7z"
+}
+
+t_n11_compress_dialog_has_folder_chooser() {
+  make_ui_stubs
+  mkdir "$W/Docs"
+  echo x >"$W/Docs/a.txt"
+  printf 'meu pacote\n\n' >"$T/entries"   # nome; volumes (vazio)
+  STUB_ENTRY_SEQ=$T/entries STUB_PW_EMPTY=1 STUB_DIR_PICK="$W/destino" CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" \
+    run_t 30 "$H" compress-dialog "$W/Docs"
+  assert_rc 0
+  grep -q -- "--file-selection --directory .*--filename=$W/\$" "$STUB_LOG" || fail "folder chooser not offered at the items' folder: $(grep file-selection "$STUB_LOG")"
+  assert_exists "$W/destino/meu pacote.7z"
+}
+
+# ------------------------------------------------------------------ progresso da compactação
+
+# progress_lines: o que o diálogo de progresso recebeu, sem a hora
+progress_lines() { cut -d' ' -f2- "$T/progress.in"; }
+
+t_p01_progress_shows_percent_in_text_and_ends_at_100() {
+  make_ui_stubs
+  head -c 60000000 /dev/urandom >"$W/p.bin"
+  CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 60 "$H" compress 7z --level 1 -- "$W/p.bin"
+  assert_rc 0
+  assert_exists "$W/p.7z"
+  local lines first last
+  lines=$(progress_lines)
+  first=$(sed -n 1p <<<"$lines")
+  [[ $first == 0 ]] || fail "first progress line should be 0, got [$first]"
+  grep -Eq '^#Compressing: p\.7z — [1-9][0-9]?%$' <<<"$lines" || fail "no intermediate percent text: $lines"
+  grep -Eq '^[1-9][0-9]?$' <<<"$lines" || fail "no intermediate bar value: $lines"
+  last=$(tail -n 2 <<<"$lines" | paste -sd'|')
+  [[ $last == '#Compressing: p.7z — 100%|100' ]] || fail "bad ending: [$last]"
+}
+
+t_p02_progress_window_stays_visible_for_small_files() {
+  make_ui_stubs
+  echo x >"$W/a.txt"
+  CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress 7z -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$T/progress.end"
+  local t0 t1
+  t0=$(sed -n 1p "$T/progress.in" | cut -d' ' -f1)
+  t1=$(<"$T/progress.end")
+  (( t1 - t0 >= 900 )) || fail "progress window closed after $((t1 - t0)) ms"
+  # o 100% chega antes do fechamento
+  progress_lines | grep -qx 100 || fail "no 100 sent"
+}
+
+t_p03_progress_minimum_time_can_be_disabled() {
+  make_ui_stubs
+  echo x >"$W/a.txt"
+  start=$SECONDS
+  CTX7Z_PROGRESS_MIN_MS=0 CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress zip -- "$W/a.txt"
+  assert_rc 0
+  assert_exists "$W/a.zip"
+  (( SECONDS - start <= 3 )) || fail "took too long without the minimum time"
+}
+
+t_p04_progress_window_is_not_auto_closed() {
+  make_ui_stubs
+  echo x >"$W/a.txt"
+  CTX7Z_PROGRESS_MIN_MS=0 CTX7Z_DIALOG=zenity PATH="$STUB:$PATH" run_t 30 "$H" compress zip -- "$W/a.txt"
+  grep -q -- '--progress' "$STUB_LOG" || fail "no progress window"
+  if grep -q -- '--auto-close' "$STUB_LOG"; then fail "--auto-close would close the window at 100% before it is seen"; fi
 }
 
 t_h13_shellcheck() {

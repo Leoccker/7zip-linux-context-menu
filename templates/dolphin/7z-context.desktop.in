@@ -20,16 +20,16 @@ Exec=@HELPER_DESKTOP_QUOTED@ compress-dialog %F
 Name=Compress to .7z
 Name[pt_BR]=Compactar em .7z
 Icon=archive-insert
-Exec=@HELPER_DESKTOP_QUOTED@ compress 7z %F
+Exec=@HELPER_DESKTOP_QUOTED@ compress 7z --ask %F
 
 [Desktop Action compressZip]
 Name=Compress to .zip
 Name[pt_BR]=Compactar em .zip
 Icon=archive-insert
-Exec=@HELPER_DESKTOP_QUOTED@ compress zip %F
+Exec=@HELPER_DESKTOP_QUOTED@ compress zip --ask %F
 
 [Desktop Action compressTarGz]
 Name=Compress to .tar.gz
 Name[pt_BR]=Compactar em .tar.gz
 Icon=archive-insert
-Exec=@HELPER_DESKTOP_QUOTED@ compress tar.gz %F
+Exec=@HELPER_DESKTOP_QUOTED@ compress tar.gz --ask %F

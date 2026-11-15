@@ -4,7 +4,9 @@ Menu de contexto do **7-Zip** para exploradores de arquivos no Linux: botão dir
 
 ## Funcionalidades
 
-- **Compactar** a seleção para `7z`, `zip`, `tar`, `tar.gz`, `tar.xz`, `tar.bz2`, ou **Adicionar ao arquivo…** (diálogo: formato, nível, nome, senha, criptografar nomes, dividir em volumes).
+- **Compactar em .7z / .zip / .tar.gz:** abre uma janela "Salvar como" já com o nome e a pasta sugeridos; é só confirmar ou trocar o nome e a pasta.
+- **Adicionar ao arquivo…:** diálogo completo com nome, **pasta de destino**, formato (`7z`, `zip`, `tar`, `tar.gz`, `tar.xz`, `tar.bz2`), nível, senha, criptografar nomes e divisão em volumes. O nome pode ser um caminho (`sub/arq` a partir da pasta escolhida, ou `/tmp/arq`); pastas que não existem são criadas.
+- **Progresso visível:** a janela mostra o nome do arquivo e a porcentagem (`Compactando: Fotos.7z — 45%`), chega a 100% e fica aberta por pelo menos 1 s mesmo em arquivos pequenos. `tar.gz`/`tar.xz`/`tar.bz2` usam barra pulsante (sem porcentagem).
 - **Extrair aqui** e **Extrair para pasta** (`nome/`), sem sobrescrever nada (conflitos viram `nome (1)`; configurável).
 - **Testar** integridade e **Listar** conteúdo.
 - Senha pedida por diálogo (3 tentativas), progresso com botão **Cancelar** (remove o arquivo parcial) e notificação ao terminar.
@@ -61,6 +63,15 @@ Tudo é instalado no diretório do usuário; nada precisa de root. O instalador 
 | `CTX7Z_LEVEL` | `0 1 3 5 7 9` | `5` |
 | `CTX7Z_LANG` | `en`, `pt_BR` | pelo `LANG` |
 
+Uso direto do helper para compactar:
+
+```sh
+7z-context-helper compress 7z --name Backup --dest ~/Documentos -- pasta1 arquivo2
+7z-context-helper compress zip --ask -- arquivo      # abre o "Salvar como"
+```
+
+`--name` aceita caminho (relativo a `--dest`, ou absoluto); `--dest` padrão é a pasta do primeiro item. Nome vazio, terminado em `/` ou `.`/`..` é recusado (código 64).
+
 Log em `~/.local/state/7z-context/`. Código de saída do helper: 0 ok, 1 avisos, 2 falha, 3 cancelado, 64 uso inválido.
 
 ## Desenvolvimento
@@ -78,13 +89,14 @@ A suíte roda tudo em `HOME` temporário, com fixtures geradas na hora (nada bin
 - **Prefixo sem `%`:** `--prefix` com `%` no caminho é recusado (ambíguo em `Exec=` de `.desktop`).
 - **Ark:** o Ark mantém o próprio menu no Dolphin; o *7-Zip* aparece ao lado, não no lugar.
 - **Thunar** só grava o `uca.xml` ao sair: feche-o (ou use `--restart`) para ver o menu.
+- **Sem diálogo gráfico** (nenhum de `kdialog`/`zenity`/`yad`): `--ask` é ignorado e o arquivo é criado com o nome e a pasta padrão.
 - **Nemo e PCManFM:** os templates são genéricos (filtro por tipo MIME/extensão); `Extensions=any;dir;` do Nemo não foi verificado em um Nemo real.
 - Um explorador pode exigir reiniciar a sessão/aplicativo para reler o menu.
 
 ## Verificado × não verificado
 
 - **Verificado (testes automatizados + execução real):** helper completo (compactar, extrair, testar, listar, senhas, cancelamento, multivolume, nomes difíceis, diálogo de compressão em modo headless e via stubs); instalador/desinstalador em todos os exploradores (arquivos gerados e validados por parsers independentes), merge do Thunar, idempotência, `--dry-run`; instalação real no Dolphin.
-- **Não verificado:** janelas reais de `zenity` (só stubs); `kdialog`/`yad`/`qdbus` (não instalados); Nautilus, Nemo, Thunar, Caja e PCManFM (não instalados — só arquivos gerados); API real do nautilus-python.
+- **Não verificado:** janela real do `zenity` no Hyprland: o progresso e o "Salvar como" foram abertos e fotografados, mas o seletor de pasta do "Adicionar ao arquivo…" e o clique em OK/Cancelar só por stubs; `kdialog`/`yad`/`qdbus` (não instalados); Nautilus, Nemo, Thunar, Caja e PCManFM (não instalados — só arquivos gerados); API real do nautilus-python.
 
 ## Licença
 
