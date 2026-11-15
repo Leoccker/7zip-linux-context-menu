@@ -1523,7 +1523,7 @@ op_doctor() {
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
-# shellcheck disable=SC2329  # chamada via trap EXIT
+# shellcheck disable=SC2317,SC2329  # chamada via trap EXIT
 cleanup() {
   local p
   ui_progress_finish 2>/dev/null

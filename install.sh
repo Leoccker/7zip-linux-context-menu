@@ -9,7 +9,7 @@
 #   ./install.sh doctor
 #
 # Everything is installed under $HOME (default prefix: ~/.local); nothing needs root.
-# shellcheck disable=SC2329  # install_<fm> functions are called by name from do_install
+# shellcheck disable=SC2317,SC2329  # install_<fm> functions are called by name from do_install
 set -u
 shopt -u patsub_replacement 2>/dev/null || true
 
