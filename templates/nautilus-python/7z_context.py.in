@@ -1,0 +1,63 @@
+# 7zctx-generated @VERSION@
+"""Menu "7-Zip" for GNOME Files (Nautilus) via nautilus-python (API 3.0 and 4.0)."""
+import os
+import subprocess
+
+import gi
+
+try:
+    gi.require_version("Nautilus", "4.0")
+except ValueError:
+    gi.require_version("Nautilus", "3.0")
+from gi.repository import GObject, Nautilus  # noqa: E402
+
+HELPER = @HELPER_PY@
+LANG = "@LANG@"
+ARCHIVE_MIMES = frozenset("@MIMETYPES@".split(";"))
+
+# (id, English, Portuguese, kind, helper arguments)
+ACTIONS = [
+    ("compress-dialog", "Add to archive…", "Adicionar ao arquivo…", "any", ["compress-dialog"]),
+    ("compress-7z", "Compress to .7z", "Compactar em .7z", "any", ["compress", "7z"]),
+    ("compress-zip", "Compress to .zip", "Compactar em .zip", "any", ["compress", "zip"]),
+    ("compress-targz", "Compress to .tar.gz", "Compactar em .tar.gz", "any", ["compress", "tar.gz"]),
+    ("extract-here", "Extract here", "Extrair aqui", "archive", ["extract-here"]),
+    ("extract-to", "Extract to folder", "Extrair para pasta própria", "archive", ["extract-to"]),
+    ("test", "Test archive", "Testar arquivo", "archive", ["test"]),
+    ("list", "List contents", "Listar conteúdo", "archive", ["list"]),
+]
+
+
+def _local_path(f):
+    if f.get_uri_scheme() != "file":
+        return None
+    return f.get_location().get_path()
+
+
+class SevenZipContext(GObject.GObject, Nautilus.MenuProvider):
+    def _run(self, _menu, args, paths):
+        subprocess.Popen(
+            [HELPER] + args + ["--"] + paths,
+            stdin=subprocess.DEVNULL,
+            cwd=os.path.dirname(paths[0]) or "/",
+        )
+
+    def get_file_items(self, *args):
+        # API 4.0: (files); API 3.0: (window, files)
+        files = args[-1]
+        paths = [_local_path(f) for f in files]
+        if not files or any(p is None for p in paths):
+            return []
+        all_archives = all((not f.is_directory()) and f.get_mime_type() in ARCHIVE_MIMES for f in files)
+        top = Nautilus.MenuItem(name="SevenZipContext::Menu", label="7-Zip")
+        sub = Nautilus.Menu()
+        top.set_submenu(sub)
+        for aid, en, pt, kind, cmd in ACTIONS:
+            if kind == "archive" and not all_archives:
+                continue
+            item = Nautilus.MenuItem(
+                name="SevenZipContext::" + aid, label=pt if LANG == "pt_BR" else en
+            )
+            item.connect("activate", self._run, cmd, paths)
+            sub.append_item(item)
+        return [top]

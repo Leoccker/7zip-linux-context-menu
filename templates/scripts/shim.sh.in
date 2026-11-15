@@ -1,0 +1,3 @@
+#!/bin/sh
+# 7zctx-generated @VERSION@
+exec @HELPER_SH_QUOTED@ @CMD@ -- "$@"

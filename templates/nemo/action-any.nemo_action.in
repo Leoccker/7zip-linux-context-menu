@@ -1,0 +1,10 @@
+[Nemo Action]
+Name=7-Zip: @NAME_EN@
+Name[pt_BR]=7-Zip: @NAME_PT@
+Comment=7-Zip
+Exec=@HELPER_SH_QUOTED@ @CMD@ %F
+Icon-Name=@ICON@
+Selection=notnone
+Extensions=any;dir;
+Quote=double
+# 7zctx-generated @VERSION@

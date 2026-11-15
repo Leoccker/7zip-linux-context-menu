@@ -1,0 +1,35 @@
+[Desktop Entry]
+Type=Service
+Name=7-Zip
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/allfiles;inode/directory;
+Actions=compressDialog;compress7z;compressZip;compressTarGz;
+X-KDE-Submenu=7-Zip
+X-KDE-Submenu[pt_BR]=7-Zip
+X-KDE-Priority=TopLevel
+Icon=package-x-generic
+# 7zctx-generated @VERSION@
+
+[Desktop Action compressDialog]
+Name=Add to archive…
+Name[pt_BR]=Adicionar ao arquivo…
+Icon=archive-insert
+Exec=@HELPER_DESKTOP_QUOTED@ compress-dialog %F
+
+[Desktop Action compress7z]
+Name=Compress to .7z
+Name[pt_BR]=Compactar em .7z
+Icon=archive-insert
+Exec=@HELPER_DESKTOP_QUOTED@ compress 7z %F
+
+[Desktop Action compressZip]
+Name=Compress to .zip
+Name[pt_BR]=Compactar em .zip
+Icon=archive-insert
+Exec=@HELPER_DESKTOP_QUOTED@ compress zip %F
+
+[Desktop Action compressTarGz]
+Name=Compress to .tar.gz
+Name[pt_BR]=Compactar em .tar.gz
+Icon=archive-insert
+Exec=@HELPER_DESKTOP_QUOTED@ compress tar.gz %F

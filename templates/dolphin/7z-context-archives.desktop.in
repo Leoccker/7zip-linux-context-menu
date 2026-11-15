@@ -1,0 +1,35 @@
+[Desktop Entry]
+Type=Service
+Name=7-Zip
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=@MIMETYPES@
+Actions=extractHere;extractTo;testArchive;listArchive;
+X-KDE-Submenu=7-Zip
+X-KDE-Submenu[pt_BR]=7-Zip
+X-KDE-Priority=TopLevel
+Icon=package-x-generic
+# 7zctx-generated @VERSION@
+
+[Desktop Action extractHere]
+Name=Extract here
+Name[pt_BR]=Extrair aqui
+Icon=archive-extract
+Exec=@HELPER_DESKTOP_QUOTED@ extract-here %F
+
+[Desktop Action extractTo]
+Name=Extract to folder
+Name[pt_BR]=Extrair para pasta própria
+Icon=archive-extract
+Exec=@HELPER_DESKTOP_QUOTED@ extract-to %F
+
+[Desktop Action testArchive]
+Name=Test archive
+Name[pt_BR]=Testar arquivo
+Icon=dialog-ok
+Exec=@HELPER_DESKTOP_QUOTED@ test %F
+
+[Desktop Action listArchive]
+Name=List contents
+Name[pt_BR]=Listar conteúdo
+Icon=view-list-text
+Exec=@HELPER_DESKTOP_QUOTED@ list %F

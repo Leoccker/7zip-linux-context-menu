@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Menu
+Name=7-Zip
+Icon=package-x-generic
+ItemsList=@ITEMS@
+# 7zctx-generated @VERSION@

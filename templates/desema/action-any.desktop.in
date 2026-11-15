@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=@NAME_EN@
+Name[pt_BR]=@NAME_PT@
+Icon=@ICON@
+Profiles=main;
+# 7zctx-generated @VERSION@
+
+[X-Action-Profile main]
+MimeTypes=all/all;
+SelectionCount=>0
+Exec=@HELPER_DESKTOP_QUOTED@ @CMD@ %F
