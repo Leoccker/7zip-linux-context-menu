@@ -1,0 +1,5 @@
+# artefatos de teste e temporários
+/tests/tmp/
+*.bak
+*.swp
+*~

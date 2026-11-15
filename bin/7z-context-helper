@@ -1,0 +1,1590 @@
+#!/usr/bin/env bash
+# 7z-context-helper - ponto único de lógica do menu de contexto 7-Zip.
+#
+# Os arquivos de integração de cada explorador só chamam:
+#     7z-context-helper <ação> [opções] <arquivos...>
+# Ver "7z-context-helper --help" e o README.md.
+#
+# Requer Bash 4+, 7-Zip (7zz, 7z ou 7za) e, opcionalmente, kdialog, zenity,
+# yad ou notify-send para a interface gráfica.
+
+set -u
+
+CTX7Z_VERSION="1.0.0"
+APP_TITLE="7-Zip"
+
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "7z-context-helper: Bash 4 or newer is required." >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------------------
+# Estado global
+# --------------------------------------------------------------------------
+RS=$'\x1f'                    # separador interno dos resultados
+PROBE_PW="__7zctx_probe__"    # senha sentinela usada só para detectar criptografia
+PW_MAX=3                      # tentativas de senha por arquivo
+
+TMPD=""
+BIN7Z=""
+BIN_LIMITED=0
+UI="none"
+UI_BIN=""
+HAVE_NOTIFY=0
+QDBUS=""
+LANG_SEL="en"
+SHARE_DIR=""
+LOG_FILE=""
+STDBUF=()
+EXT_PATTERNS=()
+MIME_TYPES=()
+
+ACTION=""
+ITEMS=()
+RESULTS=()
+OVERALL=0
+CANCELLED=0
+PARTIAL=()                    # saídas parciais a apagar se o helper for interrompido
+
+JOB_SEQ=0
+JOB_RC=0
+JOB_CANCELLED=0
+JOB_ERRF=""
+JOB_PIDS=()
+PROG_IDX=0
+PROG_N=1
+
+UI_PROG_PID=""
+UI_PROG_ACTIVE=0
+UI_KSVC=""
+UI_KPATH=""
+UI_PW_CALLS=0
+
+PW_TRIES=0
+PW_RESULT=""
+PW_NEED="none"
+PROBE_OUT=""
+ERRTXT=""
+REPLY=""
+
+# --------------------------------------------------------------------------
+# Mensagens (en padrão, pt_BR)
+# --------------------------------------------------------------------------
+declare -A M_EN=(
+  [no7z]='7-Zip was not found. Install the package: Arch: 7zip · Debian/Ubuntu: 7zip or p7zip-full · Fedora: 7zip or p7zip-plugins.'
+  [bin_bad]='CTX7Z_BIN points to a missing or non-executable file: %s'
+  [not_local]='Only local files are supported: %s'
+  [not_found]='File not found: %s'
+  [unsupported]='Not a supported archive'
+  [is_dir]='A folder is not an archive'
+  [no_write]='Cannot write to the folder: %s'
+  [cancelled]='Cancelled'
+  [ask_pw]='Password for %s'
+  [wrong_pw]='Wrong password. Try again (%d of %d).'
+  [pw_needed]='Password required (not provided)'
+  [pw_failed]='Wrong password'
+  [created]='Created: %s'
+  [extracted_to]='Extracted to: %s'
+  [ok_plain]='OK'
+  [test_ok]='No errors'
+  [sum]='%d OK, %d with warnings, %d failed'
+  [verb_compress]='Compressing'
+  [verb_extract]='Extracting'
+  [verb_test]='Testing'
+  [verb_list]='Listing'
+  [title_compress]='Compress'
+  [title_extract]='Extract'
+  [title_test]='Test archive'
+  [title_list]='List contents'
+  [prog_item]='%s %d of %d: %s'
+  [prog_one]='%s: %s'
+  [err_space]='No space left on the device'
+  [err_perm]='Permission denied'
+  [err_unsupp]='Unsupported or damaged archive'
+  [err_unsupp_hint]='Unsupported or damaged archive (only 7za is installed: install the full 7zip / p7zip-full package for RAR and more formats)'
+  [err_data]='Data error: the archive is damaged (CRC/data error)'
+  [err_generic]='Failed (7-Zip exit code %s)'
+  [need_dialog]='This action needs zenity, kdialog or yad installed to ask for input.'
+  [dlg_name]='Archive name:'
+  [dlg_format]='Archive format:'
+  [dlg_level]='Compression level:'
+  [dlg_password]='Password (optional, leave empty for none):'
+  [dlg_encnames]='Also encrypt the file names?'
+  [dlg_split]='Split into volumes (optional, e.g. 100m; leave empty for none):'
+  [lvl_0]='0 - Store (no compression)'
+  [lvl_1]='1 - Fastest'
+  [lvl_5]='5 - Normal'
+  [lvl_7]='7 - Maximum'
+  [lvl_9]='9 - Ultra'
+  [bad_name]='Invalid archive name (it must not be empty or contain "/").'
+  [bad_split]='Invalid volume size. Use a number with optional k, m or g (e.g. 100m).'
+  [pw_tar]='Passwords are only supported for the 7z and zip formats.'
+  [split_tar]='Splitting into volumes is only supported for the 7z, zip and tar formats.'
+  [usage]='Invalid usage. Run 7z-context-helper --help.'
+  [no_items]='No files were given.'
+  [dup_names]='Note: items with the same name from different folders will clash inside the archive.'
+  [fallback_tar]='7-Zip could not create the archive; used tar instead.'
+)
+
+declare -A M_PT=(
+  [no7z]='7-Zip não encontrado. Instale o pacote: Arch: 7zip · Debian/Ubuntu: 7zip ou p7zip-full · Fedora: 7zip ou p7zip-plugins.'
+  [bin_bad]='CTX7Z_BIN aponta para um arquivo inexistente ou não executável: %s'
+  [not_local]='Somente arquivos locais são suportados: %s'
+  [not_found]='Arquivo não encontrado: %s'
+  [unsupported]='Não é um arquivo compactado suportado'
+  [is_dir]='Uma pasta não é um arquivo compactado'
+  [no_write]='Não é possível gravar na pasta: %s'
+  [cancelled]='Cancelado'
+  [ask_pw]='Senha para %s'
+  [wrong_pw]='Senha incorreta. Tente novamente (%d de %d).'
+  [pw_needed]='Senha necessária (não informada)'
+  [pw_failed]='Senha incorreta'
+  [created]='Criado: %s'
+  [extracted_to]='Extraído em: %s'
+  [ok_plain]='OK'
+  [test_ok]='Sem erros'
+  [sum]='%d OK, %d com avisos, %d com falha'
+  [verb_compress]='Compactando'
+  [verb_extract]='Extraindo'
+  [verb_test]='Testando'
+  [verb_list]='Listando'
+  [title_compress]='Compactar'
+  [title_extract]='Extrair'
+  [title_test]='Testar arquivo'
+  [title_list]='Listar conteúdo'
+  [prog_item]='%s %d de %d: %s'
+  [prog_one]='%s: %s'
+  [err_space]='Sem espaço livre no dispositivo'
+  [err_perm]='Permissão negada'
+  [err_unsupp]='Arquivo não suportado ou danificado'
+  [err_unsupp_hint]='Arquivo não suportado ou danificado (só o 7za está instalado: instale o pacote 7zip / p7zip-full completo para RAR e outros formatos)'
+  [err_data]='Erro de dados: o arquivo está danificado (erro de CRC/dados)'
+  [err_generic]='Falhou (código de saída do 7-Zip: %s)'
+  [need_dialog]='Esta ação precisa de zenity, kdialog ou yad instalado para pedir dados.'
+  [dlg_name]='Nome do arquivo:'
+  [dlg_format]='Formato do arquivo:'
+  [dlg_level]='Nível de compressão:'
+  [dlg_password]='Senha (opcional, deixe em branco para nenhuma):'
+  [dlg_encnames]='Criptografar também os nomes dos arquivos?'
+  [dlg_split]='Dividir em volumes (opcional, ex.: 100m; deixe em branco para não dividir):'
+  [lvl_0]='0 - Armazenar (sem compressão)'
+  [lvl_1]='1 - Mais rápido'
+  [lvl_5]='5 - Normal'
+  [lvl_7]='7 - Máximo'
+  [lvl_9]='9 - Ultra'
+  [bad_name]='Nome de arquivo inválido (não pode ser vazio nem conter "/").'
+  [bad_split]='Tamanho de volume inválido. Use um número com k, m ou g opcional (ex.: 100m).'
+  [pw_tar]='Senha só é suportada nos formatos 7z e zip.'
+  [split_tar]='Dividir em volumes só é suportado nos formatos 7z, zip e tar.'
+  [usage]='Uso inválido. Execute 7z-context-helper --help.'
+  [no_items]='Nenhum arquivo foi informado.'
+  [dup_names]='Atenção: itens de mesmo nome vindos de pastas diferentes vão conflitar dentro do arquivo.'
+  [fallback_tar]='O 7-Zip não conseguiu criar o arquivo; foi usado o tar.'
+)
+
+# T chave [args...] -> texto no idioma escolhido (as strings são nossas, não do usuário)
+T() {
+  local key=$1 fmt
+  shift
+  if [[ $LANG_SEL == pt_BR && -n ${M_PT[$key]:-} ]]; then
+    fmt=${M_PT[$key]}
+  else
+    fmt=${M_EN[$key]:-$key}
+  fi
+  # shellcheck disable=SC2059  # o formato vem das tabelas acima, nunca do usuário
+  printf -- "$fmt" "$@"
+}
+
+# --------------------------------------------------------------------------
+# Utilidades gerais
+# --------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Remove um caminho que nós criamos, com travas contra caminhos perigosos.
+safe_rm() {
+  local p=$1
+  [[ $p == /?*/* ]] || return 0
+  [[ -e $p || -L $p ]] || return 0
+  rm -rf -- "$p"
+}
+
+# Remove saída de compactação (inclui volumes .001, .002...)
+safe_rm_archive_out() {
+  local p=$1 v
+  [[ $p == /?*/* ]] || return 0
+  rm -f -- "$p"
+  for v in "$p".[0-9][0-9][0-9]; do
+    [[ -e $v ]] && rm -f -- "$v"
+  done
+  return 0
+}
+
+log_init() {
+  local dir=${XDG_STATE_HOME:-$HOME/.local/state}/7z-context
+  mkdir -p -- "$dir" 2>/dev/null || { LOG_FILE=""; return 0; }
+  LOG_FILE=$dir/helper.log
+  if [[ -f $LOG_FILE ]]; then
+    local size
+    size=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || echo 0)
+    if (( size > 1048576 )); then
+      mv -f -- "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+    fi
+  fi
+}
+
+# Nunca registra a senha: tudo que passa por aqui é redigido.
+redact() {
+  local s=$1
+  if [[ -n $PW_RESULT ]]; then s=${s//"$PW_RESULT"/***}; fi
+  if [[ -n ${CTX7Z_PASSWORD:-} ]]; then s=${s//"$CTX7Z_PASSWORD"/***}; fi
+  printf '%s' "$s"
+}
+
+log() {
+  [[ -n $LOG_FILE ]] || return 0
+  printf '%s\t%s\n' "$(date '+%F %T')" "$(redact "$*")" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# Mascara argumentos -p<senha> de uma linha de comando antes de registrar
+mask_cmd() {
+  local a out=""
+  for a in "$@"; do
+    case $a in
+      -p?*) out+=" -p***" ;;
+      *) out+=" $a" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+# errmsg chave [args...] -> mensagem traduzida em stderr
+errmsg() { T "$@" >&2; echo >&2; }
+
+bump() { (( $1 > OVERALL )) && OVERALL=$1; return 0; }
+
+add_result() { # status(OK|WARN|FAIL) nome detalhe
+  RESULTS+=("$1$RS$2$RS$3")
+  case $1 in
+    WARN) bump 1 ;;
+    FAIL) bump 2 ;;
+  esac
+  log "result action=$ACTION status=$1 item=$2 detail=${3//$'\n'/ }"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  7z-context-helper compress <7z|zip|tar|tar.gz|tar.xz|tar.bz2> [--level N] [--name NAME] [--] FILES...
+  7z-context-helper compress-dialog FILES...
+  7z-context-helper extract-here FILES...
+  7z-context-helper extract-to   FILES...
+  7z-context-helper test         FILES...
+  7z-context-helper list         FILES...
+  7z-context-helper doctor
+  7z-context-helper --version | --help
+
+Exit codes: 0 ok, 1 warnings, 2 failure, 3 cancelled, 64 invalid usage.
+
+Environment / ~/.config/7z-context/config (KEY=value, whitelisted keys only):
+  CTX7Z_BIN        path to the 7-Zip binary (default: 7zz, 7z, 7za)
+  CTX7Z_DIALOG     kdialog | zenity | yad | notify | none (default: auto)
+  CTX7Z_OVERWRITE  rename | skip | overwrite (default: rename)
+  CTX7Z_LEVEL      0 1 3 5 7 9 (default: 5)
+  CTX7Z_LANG       en | pt_BR (default: from LANG)
+CTX7Z_DIALOG=none is the headless mode: no windows, messages on stderr and the
+password read from CTX7Z_PASSWORD (intended for tests only).
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Configuração (lida linha a linha, nunca executada)
+# --------------------------------------------------------------------------
+load_config() {
+  local f=${XDG_CONFIG_HOME:-$HOME/.config}/7z-context/config
+  local line key val k
+  declare -A cfg=()
+  if [[ -r $f ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%$'\r'}
+      [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+      [[ $line =~ ^[[:space:]]*([A-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+      key=${BASH_REMATCH[1]}
+      val=${BASH_REMATCH[2]}
+      val=${val%"${val##*[![:space:]]}"}   # remove espaços finais
+      if [[ $val == \"*\" || $val == \'*\' ]]; then val=${val:1:${#val}-2}; fi
+      case $key in
+        CTX7Z_BIN|CTX7Z_DIALOG|CTX7Z_OVERWRITE|CTX7Z_LEVEL|CTX7Z_LANG) cfg[$key]=$val ;;
+      esac
+    done <"$f"
+  fi
+  # ambiente > config > padrão
+  for k in CTX7Z_BIN CTX7Z_DIALOG CTX7Z_OVERWRITE CTX7Z_LEVEL CTX7Z_LANG; do
+    if [[ -z ${!k:-} && -n ${cfg[$k]:-} ]]; then
+      printf -v "$k" '%s' "${cfg[$k]}"
+    fi
+  done
+  CTX7Z_BIN=${CTX7Z_BIN:-}
+  CTX7Z_DIALOG=${CTX7Z_DIALOG:-}
+  CTX7Z_OVERWRITE=${CTX7Z_OVERWRITE:-rename}
+  CTX7Z_LEVEL=${CTX7Z_LEVEL:-5}
+  CTX7Z_LANG=${CTX7Z_LANG:-}
+  case $CTX7Z_OVERWRITE in rename|skip|overwrite) ;; *) CTX7Z_OVERWRITE=rename ;; esac
+  case $CTX7Z_LEVEL in 0|1|3|5|7|9) ;; *) CTX7Z_LEVEL=5 ;; esac
+  case $CTX7Z_DIALOG in ''|kdialog|zenity|yad|notify|none) ;; *) CTX7Z_DIALOG="" ;; esac
+}
+
+detect_lang() {
+  local l=${CTX7Z_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}
+  case $l in
+    pt*) LANG_SEL=pt_BR ;;
+    *) LANG_SEL=en ;;
+  esac
+}
+
+# Carrega as listas de extensões e MIME types (fonte única do projeto)
+load_lists() {
+  local self_dir d
+  self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
+  for d in "${CTX7Z_SHARE_DIR:-}" "$self_dir/../share/7z-context" "$self_dir/../share"; do
+    [[ -n $d && -r $d/extensions.list ]] && { SHARE_DIR=$d; break; }
+  done
+  local line
+  if [[ -n $SHARE_DIR ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ -z $line || $line == \#* ]] && continue
+      EXT_PATTERNS+=("$line")
+    done <"$SHARE_DIR/extensions.list"
+    if [[ -r $SHARE_DIR/mimetypes.list ]]; then
+      while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line || $line == \#* ]] && continue
+        MIME_TYPES+=("$line")
+      done <"$SHARE_DIR/mimetypes.list"
+    fi
+  fi
+  if (( ${#EXT_PATTERNS[@]} == 0 )); then
+    EXT_PATTERNS=('*.7z' '*.zip' '*.rar' '*.tar' '*.tar.gz' '*.tgz' '*.tar.bz2' '*.tbz2' '*.tar.xz' '*.txz'
+      '*.tar.zst' '*.gz' '*.bz2' '*.xz' '*.zst' '*.7z.001' '*.001' '*.iso' '*.cab')
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Detecção do binário 7-Zip
+# --------------------------------------------------------------------------
+detect_bin() {
+  if [[ -n $CTX7Z_BIN ]]; then
+    if [[ -x $CTX7Z_BIN && ! -d $CTX7Z_BIN ]]; then
+      BIN7Z=$CTX7Z_BIN
+    elif have "$CTX7Z_BIN"; then
+      BIN7Z=$(command -v "$CTX7Z_BIN")
+    else
+      return 1
+    fi
+  else
+    local c
+    for c in 7zz 7z 7za; do
+      if have "$c"; then BIN7Z=$(command -v "$c"); break; fi
+    done
+    [[ -n $BIN7Z ]] || return 2
+  fi
+  BIN_LIMITED=0
+  [[ ${BIN7Z##*/} == 7za ]] && BIN_LIMITED=1
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Camada de UI: kdialog | zenity | yad | notify | none
+# --------------------------------------------------------------------------
+has_display() { [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; }
+
+detect_ui() {
+  UI="none"
+  UI_BIN=""
+  HAVE_NOTIFY=0
+  QDBUS=""
+  local want=${CTX7Z_DIALOG:-} c
+  if [[ -n $want ]]; then
+    case $want in
+      none) UI=none ;;
+      notify) have notify-send && UI=notify ;;
+      zenity|yad|kdialog) if have "$want"; then UI=$want; UI_BIN=$(command -v "$want"); fi ;;
+    esac
+  elif has_display; then
+    if [[ ${XDG_CURRENT_DESKTOP:-} == *KDE* ]] && have kdialog; then
+      UI=kdialog
+    else
+      for c in zenity yad kdialog; do
+        if have "$c"; then UI=$c; break; fi
+      done
+    fi
+    if [[ $UI == none ]] && have notify-send; then UI=notify; fi
+    [[ $UI == zenity || $UI == yad || $UI == kdialog ]] && UI_BIN=$(command -v "$UI")
+  fi
+  if [[ $UI != none ]] && [[ -z $want || $want != none ]]; then
+    have notify-send && HAVE_NOTIFY=1
+  fi
+  for c in qdbus6 qdbus-qt6 qdbus qdbus-qt5; do
+    if have "$c"; then QDBUS=$c; break; fi
+  done
+  return 0
+}
+
+ui_is_dialog() { [[ $UI == zenity || $UI == yad || $UI == kdialog ]]; }
+
+ui_error() { # mensagem
+  log "ui_error: ${1//$'\n'/ | }"
+  case $UI in
+    zenity) "$UI_BIN" --error --no-markup --title="$APP_TITLE" --width=460 --text="$1" 2>/dev/null ;;
+    yad) "$UI_BIN" --image=dialog-error --no-markup --title="$APP_TITLE" --width=460 --text="$1" --button=gtk-ok:0 2>/dev/null ;;
+    kdialog) "$UI_BIN" --title "$APP_TITLE" --error "$1" 2>/dev/null ;;
+    notify) notify-send -a "$APP_TITLE" -u critical -i dialog-error -- "$APP_TITLE" "$1" 2>/dev/null ;;
+    none) printf '%s\n' "$1" >&2 ;;
+  esac
+  return 0
+}
+
+ui_warn() {
+  case $UI in
+    zenity) "$UI_BIN" --warning --no-markup --title="$APP_TITLE" --width=460 --text="$1" 2>/dev/null ;;
+    yad) "$UI_BIN" --image=dialog-warning --no-markup --title="$APP_TITLE" --width=460 --text="$1" --button=gtk-ok:0 2>/dev/null ;;
+    kdialog) "$UI_BIN" --title "$APP_TITLE" --sorry "$1" 2>/dev/null ;;
+    notify) notify-send -a "$APP_TITLE" -i dialog-warning -- "$APP_TITLE" "$1" 2>/dev/null ;;
+    none) printf '%s\n' "$1" >&2 ;;
+  esac
+  return 0
+}
+
+ui_info() {
+  case $UI in
+    zenity) "$UI_BIN" --info --no-markup --title="$APP_TITLE" --width=460 --text="$1" 2>/dev/null ;;
+    yad) "$UI_BIN" --image=dialog-information --no-markup --title="$APP_TITLE" --width=460 --text="$1" --button=gtk-ok:0 2>/dev/null ;;
+    kdialog) "$UI_BIN" --title "$APP_TITLE" --msgbox "$1" 2>/dev/null ;;
+    notify) notify-send -a "$APP_TITLE" -i package-x-generic -- "$APP_TITLE" "$1" 2>/dev/null ;;
+    none) printf '%s\n' "$1" >&2 ;;
+  esac
+  return 0
+}
+
+# Notificação de resumo (nunca bloqueia)
+ui_notify() { # título corpo ícone
+  local title=$1 body=$2 icon=${3:-package-x-generic}
+  if (( HAVE_NOTIFY )) || [[ $UI == notify ]]; then
+    notify-send -a "$APP_TITLE" -i "$icon" -- "$title" "$body" 2>/dev/null || true
+  elif [[ $UI == kdialog ]]; then
+    "$UI_BIN" --title "$title" --passivepopup "$body" 6 2>/dev/null || true
+  elif [[ $UI == zenity || $UI == yad ]]; then
+    ui_info "$title: $body"
+  else
+    printf '%s: %s\n' "$title" "$body" >&2
+  fi
+  return 0
+}
+
+# Pergunta sim/não. Retorna 0 = sim.
+ui_question() {
+  case $UI in
+    zenity) "$UI_BIN" --question --no-markup --title="$APP_TITLE" --width=420 --text="$1" 2>/dev/null ;;
+    yad) "$UI_BIN" --image=dialog-question --no-markup --title="$APP_TITLE" --text="$1" --button=gtk-no:1 --button=gtk-yes:0 2>/dev/null ;;
+    kdialog) "$UI_BIN" --title "$APP_TITLE" --yesno "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# Texto com valor padrão. Resultado em REPLY; retorna 1 se cancelado.
+ui_entry() { # texto padrão
+  local out rc
+  case $UI in
+    zenity) out=$("$UI_BIN" --entry --no-markup --title="$APP_TITLE" --width=460 --text="$1" --entry-text="$2" 2>/dev/null); rc=$? ;;
+    yad) out=$("$UI_BIN" --entry --no-markup --title="$APP_TITLE" --width=460 --text="$1" --entry-text="$2" 2>/dev/null); rc=$?; out=${out%|} ;;
+    kdialog) out=$("$UI_BIN" --title "$APP_TITLE" --inputbox "$1" "$2" 2>/dev/null); rc=$? ;;
+    *) return 1 ;;
+  esac
+  (( rc == 0 )) || return 1
+  REPLY=$out
+  return 0
+}
+
+# Senha. Resultado em REPLY; retorna 1 se cancelado/indisponível.
+ui_password() { # texto
+  local out rc
+  UI_PW_CALLS=$((UI_PW_CALLS + 1))
+  case $UI in
+    zenity) out=$("$UI_BIN" --password --title="$1" 2>/dev/null); rc=$? ;;
+    yad) out=$("$UI_BIN" --entry --hide-text --no-markup --title="$APP_TITLE" --width=420 --text="$1" 2>/dev/null); rc=$?; out=${out%|} ;;
+    kdialog) out=$("$UI_BIN" --title "$APP_TITLE" --password "$1" 2>/dev/null); rc=$? ;;
+    *) return 1 ;;
+  esac
+  (( rc == 0 )) || return 1
+  REPLY=$out
+  return 0
+}
+
+# Escolha única. Resultado (o valor/tag) em REPLY; retorna 1 se cancelado.
+# ui_choice texto padrão valor1 rótulo1 valor2 rótulo2 ...
+ui_choice() {
+  local text=$1 def=$2 out rc v l
+  shift 2
+  local args=()
+  case $UI in
+    zenity)
+      while (( $# >= 2 )); do
+        v=$1 l=$2; shift 2
+        if [[ $v == "$def" ]]; then args+=(TRUE "$v" "$l"); else args+=(FALSE "$v" "$l"); fi
+      done
+      out=$("$UI_BIN" --list --radiolist --no-markup --title="$APP_TITLE" --width=460 --height=360 --text="$text" \
+        --column=" " --column="ID" --column="." --hide-column=2 --print-column=2 "${args[@]}" 2>/dev/null); rc=$? ;;
+    yad)
+      while (( $# >= 2 )); do
+        v=$1 l=$2; shift 2
+        if [[ $v == "$def" ]]; then args+=(TRUE "$v" "$l"); else args+=(FALSE "$v" "$l"); fi
+      done
+      out=$("$UI_BIN" --list --radiolist --no-markup --title="$APP_TITLE" --width=460 --height=360 --text="$text" \
+        --column=":RD" --column="ID" --column="." --hide-column=2 --print-column=2 "${args[@]}" 2>/dev/null); rc=$?
+      out=${out%|} ;;
+    kdialog)
+      while (( $# >= 2 )); do
+        v=$1 l=$2; shift 2
+        if [[ $v == "$def" ]]; then args+=("$v" "$l" on); else args+=("$v" "$l" off); fi
+      done
+      out=$("$UI_BIN" --title "$APP_TITLE" --radiolist "$text" "${args[@]}" 2>/dev/null); rc=$? ;;
+    *) return 1 ;;
+  esac
+  (( rc == 0 )) || return 1
+  REPLY=$out
+  return 0
+}
+
+# Texto longo e rolável a partir de um arquivo.
+ui_text() { # título arquivo
+  case $UI in
+    zenity) "$UI_BIN" --text-info --no-markup --title="$1" --filename="$2" --width=760 --height=540 2>/dev/null ;;
+    yad) "$UI_BIN" --text-info --title="$1" --filename="$2" --width=760 --height=540 --button=gtk-close:0 2>/dev/null ;;
+    kdialog) "$UI_BIN" --title "$1" --textbox "$2" 760 540 2>/dev/null ;;
+    *) cat -- "$2" ;;
+  esac
+  return 0
+}
+
+# ---- progresso ----
+ui_progress_start() { # título texto [pulse]
+  UI_PROG_ACTIVE=0
+  local pulse=${3:-}
+  case $UI in
+    zenity|yad)
+      UI_PROG_FIFO=$TMPD/uiprog
+      mkfifo "$UI_PROG_FIFO" 2>/dev/null || return 0
+      exec 9<>"$UI_PROG_FIFO"
+      local extra=()
+      [[ -n $pulse ]] && extra+=(--pulsate)
+      "$UI_BIN" --progress --no-markup --title="$1" --text="$2" --percentage=0 --auto-close \
+        --width=460 "${extra[@]+"${extra[@]}"}" <"$UI_PROG_FIFO" >/dev/null 2>&1 &
+      UI_PROG_PID=$!
+      UI_PROG_ACTIVE=1
+      ;;
+    kdialog)
+      if [[ -n $QDBUS ]]; then
+        local ref
+        ref=$("$UI_BIN" --title "$1" --progressbar "$2" 100 2>/dev/null) || ref=""
+        if [[ -n $ref ]]; then
+          read -r UI_KSVC UI_KPATH <<<"$ref"
+          "$QDBUS" "$UI_KSVC" "$UI_KPATH" showCancelButton true >/dev/null 2>&1 || true
+          UI_PROG_ACTIVE=2
+        fi
+      fi
+      if (( UI_PROG_ACTIVE == 0 )); then ui_notify "$1" "$2" package-x-generic; fi
+      ;;
+    notify)
+      ui_notify "$1" "$2" package-x-generic
+      ;;
+  esac
+  return 0
+}
+
+ui_progress_update() { # percentual (0-99)
+  (( UI_PROG_ACTIVE )) || return 0
+  case $UI in
+    zenity|yad) printf '%s\n' "$1" >&9 2>/dev/null || true ;;
+    kdialog) "$QDBUS" "$UI_KSVC" "$UI_KPATH" Set "" value "$1" >/dev/null 2>&1 || true ;;
+  esac
+  return 0
+}
+
+ui_progress_text() {
+  (( UI_PROG_ACTIVE )) || return 0
+  local t=${1//$'\n'/ }
+  case $UI in
+    zenity|yad) printf '#%s\n' "$t" >&9 2>/dev/null || true ;;
+    kdialog) "$QDBUS" "$UI_KSVC" "$UI_KPATH" setLabelText "$t" >/dev/null 2>&1 || true ;;
+  esac
+  return 0
+}
+
+# Retorna 0 se o usuário cancelou pelo diálogo de progresso.
+ui_progress_cancelled() {
+  case $UI_PROG_ACTIVE in
+    1) kill -0 "$UI_PROG_PID" 2>/dev/null && return 1; return 0 ;;
+    2) [[ $("$QDBUS" "$UI_KSVC" "$UI_KPATH" wasCancelled 2>/dev/null) == true ]] && return 0; return 1 ;;
+  esac
+  return 1
+}
+
+ui_progress_finish() {
+  case $UI_PROG_ACTIVE in
+    1)
+      printf '100\n' >&9 2>/dev/null || true
+      exec 9>&-
+      kill "$UI_PROG_PID" 2>/dev/null || true
+      wait "$UI_PROG_PID" 2>/dev/null || true
+      ;;
+    2)
+      "$QDBUS" "$UI_KSVC" "$UI_KPATH" close >/dev/null 2>&1 || true
+      ;;
+  esac
+  UI_PROG_ACTIVE=0
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Execução de jobs com progresso e cancelamento
+# --------------------------------------------------------------------------
+_prog_pct() { # pct do item atual -> barra global
+  local g=$(( (PROG_IDX * 100 + $1) / PROG_N ))
+  (( g > 99 )) && g=99
+  ui_progress_update "$g"
+}
+
+kill_job() {
+  local p i
+  (( ${#JOB_PIDS[@]} )) || return 0
+  for p in "${JOB_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  for i in 1 2 3 4 5 6 7 8; do
+    local alive=0
+    for p in "${JOB_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    (( alive )) || return 0
+    sleep 0.25
+  done
+  for p in "${JOB_PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+  return 0
+}
+
+_job_should_cancel() {
+  if ui_progress_cancelled; then JOB_CANCELLED=1; return 0; fi
+  return 1
+}
+
+# run_job bar|pulse cmd...   -> JOB_RC, JOB_ERRF (stderr do comando), JOB_CANCELLED
+# Stdin do comando é sempre /dev/null: o 7z nunca fica esperando senha.
+run_job() {
+  local mode=$1
+  shift
+  JOB_SEQ=$((JOB_SEQ + 1))
+  JOB_ERRF=$TMPD/err.$JOB_SEQ
+  : >"$JOB_ERRF"
+  JOB_CANCELLED=0
+  JOB_RC=0
+  log "run: $(mask_cmd "$@")"
+  if [[ $mode == bar ]]; then
+    local raw=$TMPD/raw.$JOB_SEQ line pct rc last=-1
+    mkfifo "$raw"
+    "$@" </dev/null >"$raw" 2>"$JOB_ERRF" &
+    JOB_PIDS=($!)
+    exec 8< <("${STDBUF[@]+"${STDBUF[@]}"}" tr '\b\r' '\n\n' <"$raw")
+    while :; do
+      if IFS= read -r -t 0.25 -u 8 line; then
+        if [[ $line =~ ^[[:space:]]*([0-9]{1,3})% ]]; then
+          pct=$((10#${BASH_REMATCH[1]}))
+          if (( pct != last )); then last=$pct; _prog_pct "$pct"; fi
+        fi
+      else
+        rc=$?
+        (( rc > 128 )) || break   # EOF
+      fi
+      if _job_should_cancel; then kill_job; break; fi
+    done
+    exec 8<&-
+  else
+    "$@" </dev/null >/dev/null 2>"$JOB_ERRF" &
+    JOB_PIDS=($!)
+    while kill -0 "${JOB_PIDS[0]}" 2>/dev/null; do
+      if _job_should_cancel; then kill_job; break; fi
+      sleep 0.25
+    done
+  fi
+  wait "${JOB_PIDS[0]}" 2>/dev/null
+  JOB_RC=$?
+  JOB_PIDS=()
+  rm -f -- "${raw:-}" 2>/dev/null
+  if (( JOB_CANCELLED )); then JOB_RC=255; fi
+  return 0
+}
+
+# run_job2 cmd1... PIPE cmd2...  -> cmd1 | cmd2 (barra pulsante); JOB_RC = pior dos dois
+PIPE_SENT=$'\x01PIPE'
+run_job2() {
+  local a1=() a2=() cur=1 x
+  for x in "$@"; do
+    if [[ $x == "$PIPE_SENT" ]]; then cur=2; continue; fi
+    if (( cur == 1 )); then a1+=("$x"); else a2+=("$x"); fi
+  done
+  JOB_SEQ=$((JOB_SEQ + 1))
+  JOB_ERRF=$TMPD/err.$JOB_SEQ
+  local e1=$TMPD/err.$JOB_SEQ.1 e2=$TMPD/err.$JOB_SEQ.2 data=$TMPD/data.$JOB_SEQ
+  : >"$e1"; : >"$e2"
+  JOB_CANCELLED=0
+  log "run: $(mask_cmd "${a1[@]}") | $(mask_cmd "${a2[@]}")"
+  mkfifo "$data"
+  "${a1[@]}" </dev/null >"$data" 2>"$e1" &
+  local p1=$!
+  "${a2[@]}" <"$data" >/dev/null 2>"$e2" &
+  local p2=$!
+  JOB_PIDS=("$p1" "$p2")
+  while kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null; do
+    if _job_should_cancel; then kill_job; break; fi
+    sleep 0.25
+  done
+  local rc1 rc2
+  wait "$p1" 2>/dev/null; rc1=$?
+  wait "$p2" 2>/dev/null; rc2=$?
+  JOB_PIDS=()
+  cat -- "$e1" "$e2" >"$JOB_ERRF"
+  rm -f -- "$data" "$e1" "$e2"
+  JOB_RC=$(( rc1 > rc2 ? rc1 : rc2 ))
+  # um dos estágios com código de aviso (1) não pode mascarar o outro
+  if (( JOB_CANCELLED )); then JOB_RC=255; fi
+  return 0
+}
+
+# Traduz o stderr do 7z em uma mensagem curta. Resultado em ERRTXT.
+describe_error() { # arquivo_stderr código
+  local f=$1 rc=$2 txt
+  txt=$(<"$f")
+  if [[ $txt == *"No space left"* ]]; then
+    ERRTXT=$(T err_space)
+  elif [[ $txt == *"Permission denied"* || $txt == *"ccess is denied"* ]]; then
+    ERRTXT=$(T err_perm)
+  elif [[ $txt == *"Wrong password"* ]]; then
+    ERRTXT=$(T pw_failed)
+  elif [[ $txt == *"Data Error"* || $txt == *"CRC Failed"* || $txt == *"Checksum error"* || $txt == *"Headers Error"* || $txt == *"Unexpected end of archive"* ]]; then
+    ERRTXT=$(T err_data)
+  elif [[ $txt == *"Can not open the file as archive"* || $txt == *"Can't open as archive"* || $txt == *"nsupported"* || $txt == *"is not supported archive"* || $txt == *"Cannot open the file as"* ]]; then
+    if (( BIN_LIMITED )); then ERRTXT=$(T err_unsupp_hint); else ERRTXT=$(T err_unsupp); fi
+  else
+    ERRTXT=$(T err_generic "$rc")
+    local tail_txt
+    tail_txt=$(grep -v '^[[:space:]]*$' "$f" | tail -n 3)
+    [[ -n $tail_txt ]] && ERRTXT+=": ${tail_txt//$'\n'/ / }"
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Normalização de entradas
+# --------------------------------------------------------------------------
+url_decode() {
+  local s=$1 out="" ch
+  while [[ $s =~ ^([^%]*)%([0-9A-Fa-f]{2})(.*)$ ]]; do
+    out+=${BASH_REMATCH[1]}
+    printf -v ch '%b' "\\x${BASH_REMATCH[2]}"
+    out+=$ch
+    s=${BASH_REMATCH[3]}
+  done
+  out+=$s
+  REPLY=$out
+}
+
+# Preenche ITEMS com caminhos absolutos, existentes e sem duplicatas.
+normalize_args() {
+  ITEMS=()
+  local a seen=$'\n'
+  for a in "$@"; do
+    if [[ $a == file://* ]]; then
+      url_decode "${a#file://}"
+      a=$REPLY
+      [[ $a == localhost/* ]] && a=${a#localhost}
+    elif [[ $a =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+      add_result FAIL "$a" "$(T not_local "$a")"
+      continue
+    fi
+    [[ $a == /* ]] || a=$PWD/$a
+    while [[ $a == *//* || $a == */./* ]]; do a=${a//\/\//\/}; a=${a//\/.\//\/}; done
+    while (( ${#a} > 1 )) && [[ $a == */ || $a == */. ]]; do a=${a%/}; a=${a%/.}; [[ -n $a ]] || a=/; done
+    if [[ ! -e $a && ! -L $a ]]; then
+      add_result FAIL "$a" "$(T not_found "$a")"
+      continue
+    fi
+    [[ $seen == *$'\n'"$a"$'\n'* ]] && continue
+    seen+=$a$'\n'
+    ITEMS+=("$a")
+  done
+  return 0
+}
+
+# unique_path DIR BASE [EXT] -> REPLY = DIR/BASE.EXT, DIR/BASE (2).EXT ...
+unique_path() {
+  local dir=$1 base=$2 ext=${3:-} n=1 cand
+  [[ $dir == / ]] && dir=""
+  cand=$dir/$base$ext
+  while [[ -e $cand || -L $cand || -e $cand.001 ]]; do
+    n=$((n + 1))
+    cand="$dir/$base ($n)$ext"
+  done
+  REPLY=$cand
+}
+
+# --------------------------------------------------------------------------
+# Tipos de arquivo compactado
+# --------------------------------------------------------------------------
+TARBALL_SUFFIXES=(.tar.gz .tar.xz .tar.bz2 .tar.zst .tar.lz .tar.lzma .tar.z .tgz .txz .tbz2 .tbz .tzst .tlz)
+
+is_tarball() {
+  local l=${1,,} s
+  for s in "${TARBALL_SUFFIXES[@]}"; do
+    [[ $l == *"$s" ]] && return 0
+  done
+  return 1
+}
+
+is_known_archive_name() {
+  local l=${1,,} p
+  for p in "${EXT_PATTERNS[@]}"; do
+    # shellcheck disable=SC2053  # o padrão (glob) vem de share/extensions.list de propósito
+    [[ $l == $p ]] && return 0
+  done
+  return 1
+}
+
+# Nome da pasta de destino: remove a extensão de arquivo compactado (compostas incluídas).
+strip_archive_ext() { # nome -> REPLY
+  local n=$1 l=${1,,} s
+  for s in "${TARBALL_SUFFIXES[@]}"; do
+    if [[ $l == *"$s" && ${#n} -gt ${#s} ]]; then REPLY=${n:0:${#n}-${#s}}; return 0; fi
+  done
+  if [[ $l =~ \.part[0-9]+\.rar$ ]]; then
+    REPLY=${n:0:${#n}-${#BASH_REMATCH[0]}}
+  elif [[ $l =~ \.[0-9]{3,}$ ]]; then
+    local n2=${n:0:${#n}-${#BASH_REMATCH[0]}}
+    strip_archive_ext "$n2"
+    [[ $REPLY == "$n2" && $n2 != *.* ]] && REPLY=$n2
+  elif [[ $l =~ ^(.+)\.[^.]+$ ]]; then
+    if is_known_archive_name "$n" || [[ $l =~ \.(exe|jar|apk|war|epub)$ ]]; then
+      REPLY=${n:0:${#BASH_REMATCH[1]}}
+    else
+      REPLY=$n
+    fi
+  else
+    REPLY=$n
+  fi
+  [[ -n $REPLY ]] || REPLY=$n
+  return 0
+}
+
+# Mapeia qualquer volume de um conjunto dividido para o primeiro volume.
+volume_primary() { # caminho -> REPLY
+  local p=$1 d n l cand first width pre
+  d=${p%/*}; [[ -z $d ]] && d=/
+  n=${p##*/}
+  l=${n,,}
+  REPLY=$p
+  if [[ $l =~ ^(.*)\.([0-9]{3,})$ ]]; then
+    width=${#BASH_REMATCH[2]}
+    pre=${n:0:${#n}-width}
+    printf -v first '%0*d' "$width" 1
+    cand=$d/$pre$first
+    [[ -e $cand ]] && REPLY=$cand
+  elif [[ $l =~ ^(.*)\.part([0-9]+)\.rar$ ]]; then
+    width=${#BASH_REMATCH[2]}
+    local plen=${#BASH_REMATCH[1]}
+    printf -v first '%0*d' "$width" 1
+    cand=$d/${n:0:plen}${n:plen:5}$first${n: -4}
+    [[ -e $cand ]] && REPLY=$cand
+  elif [[ $l =~ ^(.*)\.r[0-9]{2}$ ]]; then
+    local plen2=${#BASH_REMATCH[1]}
+    for cand in "$d/${n:0:plen2}.rar" "$d/${n:0:plen2}.RAR"; do
+      [[ -e $cand ]] && { REPLY=$cand; break; }
+    done
+  elif [[ $l =~ ^(.*)\.z[0-9]{2}$ ]]; then
+    local plen3=${#BASH_REMATCH[1]}
+    for cand in "$d/${n:0:plen3}.zip" "$d/${n:0:plen3}.ZIP"; do
+      [[ -e $cand ]] && { REPLY=$cand; break; }
+    done
+  fi
+  return 0
+}
+
+ao_switch() {
+  case $CTX7Z_OVERWRITE in
+    skip) printf -- '-aos' ;;
+    overwrite) printf -- '-aoa' ;;
+    *) printf -- '-aou' ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# Senhas
+# --------------------------------------------------------------------------
+# pw_probe ARQ -> PW_NEED = none|content|header|bad
+pw_probe() {
+  local out rc
+  out=$("$BIN7Z" l -slt -spd "-p$PROBE_PW" -- "$1" </dev/null 2>&1)
+  rc=$?
+  PROBE_OUT=$out
+  if [[ $out == *"ncrypted archive"* ]]; then
+    PW_NEED=header
+  elif [[ $out == *$'\nEncrypted = +'* ]]; then
+    PW_NEED=content
+  elif (( rc >= 2 )); then
+    PW_NEED=bad
+  else
+    PW_NEED=none
+  fi
+}
+
+# pw_valid ARQ SENHA NEED -> 0 se a senha confere (ou não dá para validar barato)
+pw_valid() {
+  local arc=$1 pw=$2 need=$3 size
+  if [[ $need == header ]]; then
+    "$BIN7Z" l -spd "-p$pw" -- "$arc" </dev/null >/dev/null 2>&1
+    return $?
+  fi
+  size=$(stat -c %s -- "$arc" 2>/dev/null || echo 0)
+  if (( size < 52428800 )); then
+    "$BIN7Z" t -spd "-p$pw" -- "$arc" </dev/null >/dev/null 2>&1
+    return $?
+  fi
+  return 0
+}
+
+# obtain_password ARQ NEED NOME -> PW_RESULT. 0 ok, 1 indisponível/cancelado, 2 errada
+obtain_password() {
+  local arc=$1 need=$2 name=$3 cand
+  PW_RESULT=""
+  while (( PW_TRIES < PW_MAX )); do
+    if [[ $UI == none ]]; then
+      # modo headless: só uma tentativa, vinda de CTX7Z_PASSWORD
+      if [[ -z ${CTX7Z_PASSWORD:-} || $PW_TRIES -gt 0 ]]; then
+        (( PW_TRIES > 0 )) && return 2
+        return 1
+      fi
+      cand=$CTX7Z_PASSWORD
+    else
+      ui_password "$(T ask_pw "$name")" || return 1
+      cand=$REPLY
+    fi
+    PW_TRIES=$((PW_TRIES + 1))
+    if [[ -n $cand ]] && pw_valid "$arc" "$cand" "$need"; then
+      PW_RESULT=$cand
+      return 0
+    fi
+    if (( PW_TRIES < PW_MAX )) && [[ $UI != none ]]; then
+      ui_warn "$(T wrong_pw "$PW_TRIES" "$PW_MAX")"
+    fi
+  done
+  return 2
+}
+
+# --------------------------------------------------------------------------
+# Preparação comum a extract/test/list
+# --------------------------------------------------------------------------
+ARCS=()      # primeiro volume de cada conjunto, sem duplicatas
+A_KIND=()    # arc | tar
+A_NEED=()
+A_PW=()
+A_OK=()
+
+prepare_archives() {
+  ARCS=(); A_KIND=(); A_NEED=(); A_PW=(); A_OK=()
+  local it seen=$'\n' arc name kind i=0
+  for it in "${ITEMS[@]}"; do
+    volume_primary "$it"
+    arc=$REPLY
+    [[ $seen == *$'\n'"$arc"$'\n'* ]] && continue
+    seen+=$arc$'\n'
+    ARCS+=("$arc")
+  done
+  for arc in "${ARCS[@]}"; do
+    name=${arc##*/}
+    kind=arc
+    is_tarball "$name" && kind=tar
+    A_KIND[i]=$kind; A_NEED[i]=none; A_PW[i]=""; A_OK[i]=1
+    if [[ -d $arc ]]; then
+      add_result FAIL "$name" "$(T is_dir)"
+      A_OK[i]=0; i=$((i + 1)); continue
+    fi
+    pw_probe "$arc"
+    A_NEED[i]=$PW_NEED
+    if [[ $PW_NEED == bad ]]; then
+      # extensão conhecida ou não, o 7z não consegue abrir
+      describe_error <(printf '%s' "$PROBE_OUT") 2
+      if is_known_archive_name "$name"; then
+        add_result FAIL "$name" "$ERRTXT"
+      else
+        add_result FAIL "$name" "$(T unsupported)"
+      fi
+      A_OK[i]=0
+    elif [[ $PW_NEED != none ]]; then
+      PW_TRIES=0
+      obtain_password "$arc" "$PW_NEED" "$name"
+      case $? in
+        0) A_PW[i]=$PW_RESULT ;;
+        1) add_result FAIL "$name" "$(T pw_needed)"; A_OK[i]=0 ;;
+        *) add_result FAIL "$name" "$(T pw_failed)"; A_OK[i]=0 ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Resumo e saída
+# --------------------------------------------------------------------------
+finish() { # título_da_ação
+  local title=$1 ok=0 warn=0 fail=0 r st rest nm dt body="" line
+  local lines=0
+  for r in "${RESULTS[@]+"${RESULTS[@]}"}"; do
+    st=${r%%"$RS"*}
+    rest=${r#*"$RS"}
+    nm=${rest%%"$RS"*}
+    dt=${rest#*"$RS"}
+    case $st in OK) ok=$((ok + 1)) ;; WARN) warn=$((warn + 1)) ;; FAIL) fail=$((fail + 1)) ;; esac
+    if [[ $UI == none ]]; then
+      printf '%s: %s%s\n' "$st" "$nm" "${dt:+: $dt}" >&2
+    fi
+    case $st in OK) line="✔ $nm" ;; WARN) line="⚠ $nm" ;; *) line="✖ $nm" ;; esac
+    [[ -n $dt ]] && line+=" — $dt"
+    if (( lines < 12 )); then body+=$line$'\n'; fi
+    lines=$((lines + 1))
+  done
+  (( lines > 12 )) && body+="… (+$((lines - 12)))"$'\n'
+  body=${body%$'\n'}
+  local summary
+  summary=$(T sum "$ok" "$warn" "$fail")
+  if (( CANCELLED )); then
+    summary=$(T cancelled)
+    log "finish action=$ACTION cancelled"
+    [[ $UI == none ]] && printf '%s\n' "$summary" >&2
+    ui_notify "$title" "$summary" dialog-information
+    return 3
+  fi
+  log "finish action=$ACTION ok=$ok warn=$warn fail=$fail"
+  if (( fail > 0 || warn > 0 )); then
+    if [[ $UI == none ]]; then printf '%s\n' "$summary" >&2; fi
+    ui_error "$title — $summary"$'\n\n'"$body"
+  elif [[ $ACTION == test ]] && ui_is_dialog; then
+    ui_info "$title — $summary"$'\n\n'"$body"
+  elif [[ $UI == none ]]; then
+    printf '%s\n' "$summary" >&2
+  else
+    ui_notify "$title" "$summary"$'\n'"$body" package-x-generic
+  fi
+  return "$OVERALL"
+}
+
+# --------------------------------------------------------------------------
+# compress
+# --------------------------------------------------------------------------
+valid_format() {
+  case $1 in 7z|zip|tar|tar.gz|tar.xz|tar.bz2) return 0 ;; *) return 1 ;; esac
+}
+
+# Nome padrão (sem extensão) a partir dos ITEMS
+default_archive_base() {
+  local b
+  if (( ${#ITEMS[@]} == 1 )); then
+    b=${ITEMS[0]##*/}
+    if [[ ! -d ${ITEMS[0]} && $b =~ ^(.+)\.[^.]+$ ]]; then b=${BASH_REMATCH[1]}; fi
+  else
+    local parent=${ITEMS[0]%/*}
+    [[ -z $parent ]] && parent=/
+    b=${parent##*/}
+  fi
+  [[ -n $b ]] || b=Archive
+  REPLY=$b
+}
+
+# do_compress FORMATO NÍVEL NOME(sem ext. ou com) SENHA CRIPTO_NOMES(0|1) DIVISÃO
+do_compress() {
+  local fmt=$1 level=$2 name=$3 pw=$4 enc=$5 split=$6
+  local dest=${ITEMS[0]%/*}
+  [[ -z $dest ]] && dest=/
+  if [[ ! -d $dest || ! -w $dest ]]; then
+    add_result FAIL "${ITEMS[0]##*/}" "$(T no_write "$dest")"
+    return 0
+  fi
+  local ext=.$fmt base=$name
+  [[ ${name,,} == *"$ext" && ${#name} -gt ${#ext} ]] && base=${name:0:${#name}-${#ext}}
+  unique_path "$dest" "$base" "$ext"
+  local out=$REPLY outname
+  outname=${out##*/}
+
+  local cmd=() pipeline=0 inner
+  PARTIAL+=("$out")
+  case $fmt in
+    7z)
+      cmd=("$BIN7Z" a -t7z "-mx=$level" -spd -bsp1 -bso0 -bse2)
+      [[ -n $pw ]] && cmd+=("-p$pw")
+      [[ -n $pw && $enc == 1 ]] && cmd+=(-mhe=on)
+      ;;
+    zip)
+      cmd=("$BIN7Z" a -tzip "-mx=$level" -mcu=on -spd -bsp1 -bso0 -bse2)
+      [[ -n $pw ]] && cmd+=("-p$pw" -mem=AES256)
+      ;;
+    tar)
+      cmd=("$BIN7Z" a -ttar -spd -bsp1 -bso0 -bse2)
+      ;;
+    tar.gz|tar.xz|tar.bz2) pipeline=1 ;;
+  esac
+  [[ -n $split && $pipeline == 0 ]] && cmd+=("-v$split")
+
+  local label
+  label=$(T prog_one "$(T verb_compress)" "$outname")
+  ui_progress_text "$label"
+  if (( pipeline )); then
+    local type
+    case $fmt in tar.gz) type=gzip ;; tar.xz) type=xz ;; tar.bz2) type=bzip2 ;; esac
+    inner=${outname%."$fmt"}.tar
+    run_job2 "$BIN7Z" a -ttar -so -an -spd -- "${ITEMS[@]}" "$PIPE_SENT" \
+      "$BIN7Z" a "-t$type" "-si$inner" "-mx=$level" -- "$out"
+  else
+    run_job bar "${cmd[@]}" -- "$out" "${ITEMS[@]}"
+  fi
+
+  if (( JOB_CANCELLED )); then
+    CANCELLED=1
+    safe_rm_archive_out "$out"
+    PARTIAL=()
+    return 0
+  fi
+
+  # Fallback do pipeline: tar do sistema (itens de uma mesma pasta ou de várias com -C)
+  if (( pipeline && JOB_RC != 0 )) && have tar; then
+    log "pipeline failed rc=$JOB_RC, trying tar fallback"
+    safe_rm_archive_out "$out"
+    local flag tarcmd=(tar) it
+    case $fmt in tar.gz) flag=z ;; tar.xz) flag=J ;; tar.bz2) flag=j ;; esac
+    tarcmd+=("-c${flag}f" "$out")
+    for it in "${ITEMS[@]}"; do
+      tarcmd+=(-C "${it%/*}" -- "${it##*/}")
+    done
+    # "--" entre -C e nomes só funciona uma vez; com várias pastas usa-se ./nome
+    if (( ${#ITEMS[@]} > 1 )); then
+      tarcmd=(tar "-c${flag}f" "$out")
+      for it in "${ITEMS[@]}"; do tarcmd+=(-C "${it%/*}" "./${it##*/}"); done
+    fi
+    run_job pulse "${tarcmd[@]}"
+    if (( JOB_RC == 0 )); then
+      add_result WARN "$outname" "$(T fallback_tar)"
+      PARTIAL=()
+      return 0
+    fi
+  fi
+
+  if (( JOB_RC == 0 )); then
+    add_result OK "$outname" "$(T created "$outname")"
+    PARTIAL=()
+  elif (( JOB_RC == 1 )); then
+    describe_error "$JOB_ERRF" "$JOB_RC"
+    add_result WARN "$outname" "$ERRTXT"
+    PARTIAL=()
+  else
+    describe_error "$JOB_ERRF" "$JOB_RC"
+    add_result FAIL "$outname" "$ERRTXT"
+    safe_rm_archive_out "$out"
+    PARTIAL=()
+  fi
+  return 0
+}
+
+op_compress() {
+  local fmt=${1:-} level=$CTX7Z_LEVEL name=""
+  shift || true
+  valid_format "$fmt" || { errmsg usage; return 64; }
+  while (( $# )); do
+    case $1 in
+      --level) [[ ${2:-} =~ ^(0|1|3|5|7|9)$ ]] || { errmsg usage; return 64; }; level=$2; shift 2 ;;
+      --name) [[ -n ${2:-} ]] || { errmsg usage; return 64; }; name=$2; shift 2 ;;
+      --) shift; break ;;
+      -*) errmsg usage; return 64 ;;
+      *) break ;;
+    esac
+  done
+  (( $# )) || { errmsg no_items; return 64; }
+  normalize_args "$@"
+  if (( ${#ITEMS[@]} == 0 )); then finish "$(T title_compress)"; return $?; fi
+  if [[ -z $name ]]; then default_archive_base; name=$REPLY; fi
+  PROG_IDX=0; PROG_N=1
+  ui_progress_start "$(T title_compress)" "$(T verb_compress)…" "$([[ $fmt == tar.* ]] && echo pulse)"
+  do_compress "$fmt" "$level" "$name" "" 0 ""
+  ui_progress_finish
+  finish "$(T title_compress)"
+}
+
+op_compress_dialog() {
+  (( $# )) || { errmsg no_items; return 64; }
+  normalize_args "$@"
+  if (( ${#ITEMS[@]} == 0 )); then finish "$(T title_compress)"; return $?; fi
+  default_archive_base
+  local def_name=$REPLY
+  local f_name f_fmt f_level f_pw f_enc f_split
+  while :; do
+    if ! compress_form "$def_name"; then
+      CANCELLED=1
+      finish "$(T title_compress)"
+      return 3
+    fi
+    f_name=$F_NAME; f_fmt=$F_FMT; f_level=$F_LEVEL; f_pw=$F_PW; f_enc=$F_ENC; f_split=$F_SPLIT
+    local err=""
+    if [[ -z $f_name || $f_name == */* ]]; then err=$(T bad_name)
+    elif ! valid_format "$f_fmt"; then err=$(T usage)
+    elif [[ -n $f_pw && $f_fmt != 7z && $f_fmt != zip ]]; then err=$(T pw_tar)
+    elif [[ -n $f_split && ! $f_split =~ ^[0-9]+[kKmMgG]?$ ]]; then err=$(T bad_split)
+    elif [[ -n $f_split && $f_fmt == tar.* ]]; then err=$(T split_tar)
+    fi
+    [[ $f_level =~ ^(0|1|3|5|7|9)$ ]] || f_level=$CTX7Z_LEVEL
+    if [[ -z $err ]]; then break; fi
+    if [[ $UI == none ]]; then
+      printf '%s\n' "$err" >&2
+      return 64
+    fi
+    ui_error "$err"
+    def_name=${f_name:-$def_name}
+  done
+  PROG_IDX=0; PROG_N=1
+  PW_RESULT=$f_pw
+  ui_progress_start "$(T title_compress)" "$(T verb_compress)…" "$([[ $f_fmt == tar.* ]] && echo pulse)"
+  do_compress "$f_fmt" "$f_level" "$f_name" "$f_pw" "$f_enc" "$f_split"
+  ui_progress_finish
+  finish "$(T title_compress)"
+}
+
+# Formulário de compactação. Preenche F_NAME F_FMT F_LEVEL F_PW F_ENC F_SPLIT.
+# Retorna 1 se cancelado. Em modo headless lê CTX7Z_FORM_* (para testes).
+compress_form() { # nome_padrão
+  local def=$1
+  F_NAME=$def; F_FMT=7z; F_LEVEL=$CTX7Z_LEVEL; F_PW=""; F_ENC=0; F_SPLIT=""
+  if [[ $UI == none ]]; then
+    [[ ${CTX7Z_FORM_CANCEL:-0} == 1 ]] && return 1
+    F_NAME=${CTX7Z_FORM_NAME:-$def}
+    F_FMT=${CTX7Z_FORM_FORMAT:-7z}
+    F_LEVEL=${CTX7Z_FORM_LEVEL:-$CTX7Z_LEVEL}
+    F_PW=${CTX7Z_FORM_PASSWORD:-}
+    F_ENC=${CTX7Z_FORM_ENCNAMES:-0}
+    F_SPLIT=${CTX7Z_FORM_SPLIT:-}
+    return 0
+  fi
+  if ! ui_is_dialog; then
+    ui_error "$(T need_dialog)"
+    return 1
+  fi
+  ui_entry "$(T dlg_name)" "$F_NAME" || return 1
+  F_NAME=$REPLY
+  ui_choice "$(T dlg_format)" 7z 7z "7z" zip "zip" tar "tar" tar.gz "tar.gz" tar.xz "tar.xz" tar.bz2 "tar.bz2" || return 1
+  F_FMT=$REPLY
+  ui_choice "$(T dlg_level)" "$F_LEVEL" 0 "$(T lvl_0)" 1 "$(T lvl_1)" 5 "$(T lvl_5)" 7 "$(T lvl_7)" 9 "$(T lvl_9)" || return 1
+  F_LEVEL=$REPLY
+  if [[ $F_FMT == 7z || $F_FMT == zip ]]; then
+    ui_password "$(T dlg_password)" && F_PW=$REPLY || return 1
+    if [[ $F_FMT == 7z && -n $F_PW ]]; then
+      if ui_question "$(T dlg_encnames)"; then F_ENC=1; fi
+    fi
+  fi
+  if [[ $F_FMT != tar.* ]]; then
+    ui_entry "$(T dlg_split)" "" || return 1
+    F_SPLIT=$REPLY
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# extract-here / extract-to
+# --------------------------------------------------------------------------
+# extract_run ARQ DEST KIND SENHA -> JOB_RC / JOB_ERRF
+extract_run() {
+  local arc=$1 dest=$2 kind=$3 pw=$4 ao
+  ao=$(ao_switch)
+  local pwarg=()
+  [[ -n $pw ]] && pwarg=("-p$pw")
+  if [[ $kind == tar ]]; then
+    run_job2 "$BIN7Z" x -so -spd -- "$arc" "$PIPE_SENT" \
+      "$BIN7Z" x -si -ttar -spd "$ao" "-o$dest"
+    if (( JOB_RC != 0 && JOB_CANCELLED == 0 )) && have tar; then
+      log "tar pipeline failed rc=$JOB_RC, trying system tar"
+      local keep=--skip-old-files
+      [[ $CTX7Z_OVERWRITE == overwrite ]] && keep=--overwrite
+      run_job pulse tar -xf "$arc" -C "$dest" "$keep"
+    fi
+  else
+    run_job bar "$BIN7Z" x -spd "$ao" "-o$dest" -bsp1 -bso0 -bse2 "${pwarg[@]+"${pwarg[@]}"}" -- "$arc"
+  fi
+}
+
+op_extract() { # here|to
+  local mode=$1
+  shift
+  (( $# )) || { errmsg no_items; return 64; }
+  normalize_args "$@"
+  local title
+  title=$(T title_extract)
+  if (( ${#ITEMS[@]} == 0 )); then finish "$title"; return $?; fi
+  prepare_archives
+  local n=${#ARCS[@]} i name dir dest created
+  PROG_N=$n
+  local started=0
+  for ((i = 0; i < n; i++)); do
+    [[ ${A_OK[i]} == 1 ]] && started=1
+  done
+  (( started )) && ui_progress_start "$title" "$(T verb_extract)…" "$([[ ${#ARCS[@]} == 1 && ${A_KIND[0]} == tar ]] && echo pulse)"
+  for ((i = 0; i < n; i++)); do
+    [[ ${A_OK[i]} == 1 ]] || continue
+    local arc=${ARCS[i]}
+    name=${arc##*/}
+    dir=${arc%/*}; [[ -z $dir ]] && dir=/
+    PROG_IDX=$i
+    ui_progress_text "$(T prog_item "$(T verb_extract)" $((i + 1)) "$n" "$name")"
+    if [[ ! -w $dir ]]; then
+      add_result FAIL "$name" "$(T no_write "$dir")"
+      continue
+    fi
+    dest=$dir
+    created=0
+    if [[ $mode == to ]]; then
+      strip_archive_ext "$name"
+      unique_path "$dir" "$REPLY"
+      dest=$REPLY
+      if ! mkdir -- "$dest" 2>/dev/null; then
+        add_result FAIL "$name" "$(T no_write "$dir")"
+        continue
+      fi
+      created=1
+      PARTIAL+=("$dest")
+    fi
+    PW_RESULT=${A_PW[i]}
+    PW_TRIES=0
+    [[ ${A_NEED[i]} != none ]] && PW_TRIES=1
+    while :; do
+      extract_run "$arc" "$dest" "${A_KIND[i]}" "$PW_RESULT"
+      if (( JOB_CANCELLED )); then break; fi
+      # senha errada só descoberta na extração (arquivos grandes): pergunta de novo
+      if (( JOB_RC >= 2 )) && [[ ${A_NEED[i]} != none ]] && grep -q 'Wrong password' "$JOB_ERRF" 2>/dev/null \
+        && (( PW_TRIES < PW_MAX )) && [[ $UI != none ]]; then
+        if (( created )); then safe_rm "$dest"; mkdir -- "$dest" 2>/dev/null; fi
+        ui_warn "$(T wrong_pw "$PW_TRIES" "$PW_MAX")"
+        if obtain_password "$arc" "${A_NEED[i]}" "$name"; then continue; fi
+      fi
+      break
+    done
+    if (( JOB_CANCELLED )); then
+      CANCELLED=1
+      (( created )) && safe_rm "$dest"
+      PARTIAL=()
+      break
+    fi
+    if (( JOB_RC == 0 )); then
+      add_result OK "$name" "$(T extracted_to "$dest")"
+    elif (( JOB_RC == 1 )); then
+      describe_error "$JOB_ERRF" "$JOB_RC"
+      add_result WARN "$name" "$ERRTXT"
+    else
+      describe_error "$JOB_ERRF" "$JOB_RC"
+      add_result FAIL "$name" "$ERRTXT"
+      (( created )) && safe_rm "$dest"
+    fi
+    PARTIAL=()
+  done
+  ui_progress_finish
+  finish "$title"
+}
+
+# --------------------------------------------------------------------------
+# test / list
+# --------------------------------------------------------------------------
+op_test() {
+  (( $# )) || { errmsg no_items; return 64; }
+  normalize_args "$@"
+  local title
+  title=$(T title_test)
+  if (( ${#ITEMS[@]} == 0 )); then finish "$title"; return $?; fi
+  prepare_archives
+  local n=${#ARCS[@]} i name started=0
+  PROG_N=$n
+  for ((i = 0; i < n; i++)); do [[ ${A_OK[i]} == 1 ]] && started=1; done
+  (( started )) && ui_progress_start "$title" "$(T verb_test)…"
+  for ((i = 0; i < n; i++)); do
+    [[ ${A_OK[i]} == 1 ]] || continue
+    name=${ARCS[i]##*/}
+    PROG_IDX=$i
+    ui_progress_text "$(T prog_item "$(T verb_test)" $((i + 1)) "$n" "$name")"
+    local pwarg=()
+    [[ -n ${A_PW[i]} ]] && pwarg=("-p${A_PW[i]}")
+    PW_RESULT=${A_PW[i]}
+    run_job bar "$BIN7Z" t -spd -bsp1 -bso0 -bse2 "${pwarg[@]+"${pwarg[@]}"}" -- "${ARCS[i]}"
+    if (( JOB_CANCELLED )); then CANCELLED=1; break; fi
+    if (( JOB_RC == 0 )); then
+      add_result OK "$name" "$(T test_ok)"
+    else
+      describe_error "$JOB_ERRF" "$JOB_RC"
+      local det
+      det=$ERRTXT
+      local extra
+      extra=$(grep -v '^[[:space:]]*$' "$JOB_ERRF" | tail -n 20)
+      [[ -n $extra ]] && det+=$'\n'"$extra"
+      if (( JOB_RC == 1 )); then add_result WARN "$name" "$det"; else add_result FAIL "$name" "$det"; fi
+    fi
+  done
+  ui_progress_finish
+  finish "$title"
+}
+
+op_list() {
+  (( $# )) || { errmsg no_items; return 64; }
+  normalize_args "$@"
+  local title
+  title=$(T title_list)
+  if (( ${#ITEMS[@]} == 0 )); then finish "$title"; return $?; fi
+  prepare_archives
+  local n=${#ARCS[@]} i name out=$TMPD/list.txt shown=0
+  : >"$out"
+  for ((i = 0; i < n; i++)); do
+    [[ ${A_OK[i]} == 1 ]] || continue
+    name=${ARCS[i]##*/}
+    local pwarg=()
+    [[ -n ${A_PW[i]} ]] && pwarg=("-p${A_PW[i]}")
+    PW_RESULT=${A_PW[i]}
+    {
+      printf '=== %s ===\n' "$name"
+      if [[ ${A_KIND[i]} == tar ]]; then
+        "$BIN7Z" x -so -spd -- "${ARCS[i]}" </dev/null 2>"$TMPD/list.err" | "$BIN7Z" l -si -ttar -spd 2>>"$TMPD/list.err"
+        local ps=("${PIPESTATUS[@]}") rc
+        rc=${ps[0]}
+        (( rc == 0 )) && rc=${ps[1]}
+      else
+        "$BIN7Z" l -spd "${pwarg[@]+"${pwarg[@]}"}" -- "${ARCS[i]}" </dev/null 2>"$TMPD/list.err"
+        local rc=$?
+      fi
+      printf '\n'
+      echo "$rc" >"$TMPD/list.rc"
+    } >>"$out"
+    local lrc
+    lrc=$(<"$TMPD/list.rc")
+    if (( lrc >= 2 )); then
+      describe_error "$TMPD/list.err" "$lrc"
+      add_result FAIL "$name" "$ERRTXT"
+    else
+      shown=1
+      add_result OK "$name" ""
+    fi
+  done
+  if (( shown )); then
+    ui_text "$title" "$out"
+  fi
+  # a listagem em si é a resposta: só mostra resumo se houve falha
+  local failed=0 r
+  for r in "${RESULTS[@]+"${RESULTS[@]}"}"; do [[ $r == FAIL* ]] && failed=1; done
+  if (( failed )); then
+    finish "$title"
+    return $?
+  fi
+  log "finish action=list ok"
+  return "$OVERALL"
+}
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+op_doctor() {
+  local rc=0 ver d
+  echo "7z-context-helper $CTX7Z_VERSION"
+  echo "bash: $BASH_VERSION"
+  if detect_bin; then
+    ver=$("$BIN7Z" 2>&1 </dev/null | grep -m1 -i '7-zip\|p7zip' || true)
+    echo "7z binary: $BIN7Z"
+    echo "7z version: ${ver:-unknown}"
+    (( BIN_LIMITED )) && echo "warning: 7za detected - limited formats (no RAR); install the full 7zip package"
+  else
+    local e=$?
+    if (( e == 1 )); then T bin_bad "$CTX7Z_BIN" >&2; else T no7z >&2; fi
+    echo >&2
+    rc=1
+  fi
+  detect_ui
+  echo "ui backend: $UI${UI_BIN:+ ($UI_BIN)}"
+  for d in kdialog zenity yad notify-send qdbus6 qdbus python3; do
+    if have "$d"; then echo "tool $d: $(command -v "$d")"; else echo "tool $d: not found"; fi
+  done
+  echo "overwrite policy: $CTX7Z_OVERWRITE"
+  echo "compression level: $CTX7Z_LEVEL"
+  echo "language: $LANG_SEL"
+  echo "config: ${XDG_CONFIG_HOME:-$HOME/.config}/7z-context/config"
+  echo "log: ${LOG_FILE:-unavailable}"
+  echo "share dir: ${SHARE_DIR:-not found (using built-in lists)}"
+  echo "extension patterns: ${#EXT_PATTERNS[@]}, mime types: ${#MIME_TYPES[@]}"
+  return $rc
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+# shellcheck disable=SC2329  # chamada via trap EXIT
+cleanup() {
+  local p
+  ui_progress_finish 2>/dev/null
+  if (( ${#JOB_PIDS[@]} )); then kill "${JOB_PIDS[@]}" 2>/dev/null; fi
+  for p in "${PARTIAL[@]+"${PARTIAL[@]}"}"; do
+    safe_rm_archive_out "$p"
+    [[ -d $p ]] && safe_rm "$p"
+  done
+  if [[ -n $TMPD && -d $TMPD ]]; then rm -rf -- "$TMPD"; fi
+}
+
+main() {
+  case ${1:-} in
+    -h|--help|help) usage; return 0 ;;
+    -V|--version|version) echo "7z-context-helper $CTX7Z_VERSION"; return 0 ;;
+    '') usage >&2; return 64 ;;
+  esac
+  ACTION=$1
+  shift
+
+  load_config
+  detect_lang
+  load_lists
+  log_init
+
+  case $ACTION in
+    compress|compress-dialog|extract-here|extract-to|test|list|doctor) ;;
+    *) errmsg usage; return 64 ;;
+  esac
+
+  if [[ $ACTION == doctor ]]; then op_doctor; return $?; fi
+
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/7zctx.XXXXXX") || { echo "cannot create a temporary directory" >&2; return 2; }
+  trap cleanup EXIT
+  trap 'CANCELLED=1; exit 3' INT TERM HUP
+  trap '' PIPE
+  have stdbuf && STDBUF=(stdbuf -o0)
+
+  detect_ui
+  local e=0
+  detect_bin || e=$?
+  if (( e != 0 )); then
+    if (( e == 1 )); then ui_error "$(T bin_bad "$CTX7Z_BIN")"; else ui_error "$(T no7z)"; fi
+    return 2
+  fi
+
+  [[ ${1:-} == -- && $ACTION != compress ]] && shift
+  local start=$SECONDS rc
+  log "start action=$ACTION bin=$BIN7Z ui=$UI items=$#"
+  case $ACTION in
+    compress) op_compress "$@" ;;
+    compress-dialog) op_compress_dialog "$@" ;;
+    extract-here) op_extract here "$@" ;;
+    extract-to) op_extract to "$@" ;;
+    test) op_test "$@" ;;
+    list) op_list "$@" ;;
+  esac
+  rc=$?
+  log "end action=$ACTION rc=$rc duration=$((SECONDS - start))s"
+  return "$rc"
+}
+
+main "$@"
+exit $?
